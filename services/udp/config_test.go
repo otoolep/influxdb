@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
-	"github.com/influxdb/influxdb/services/udp"
+	"github.com/influxdata/influxdb/services/udp"
 )
 
 func TestConfig_Parse(t *testing.T) {
@@ -39,7 +39,5 @@ udp-payload-size = 1500
 		t.Fatalf("unexpected batch pending: %d", c.BatchPending)
 	} else if time.Duration(c.BatchTimeout) != (10 * time.Millisecond) {
 		t.Fatalf("unexpected batch timeout: %v", c.BatchTimeout)
-	} else if c.UDPPayloadSize != 1500 {
-		t.Fatalf("unexpected udp-payload-size: %d", c.UDPPayloadSize)
 	}
 }

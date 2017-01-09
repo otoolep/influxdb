@@ -1,23 +1,24 @@
-package bz1
+// Package bz1 reads data from bz1 shards.
+package bz1 // import "github.com/influxdata/influxdb/cmd/influx_tsm/bz1"
 
 import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
-	"sync/atomic"
 	"time"
 
 	"github.com/boltdb/bolt"
 	"github.com/golang/snappy"
-	"github.com/influxdb/influxdb/cmd/influx_tsm/tsdb"
-	tsm "github.com/influxdb/influxdb/tsdb/engine/tsm1"
+	"github.com/influxdata/influxdb/cmd/influx_tsm/stats"
+	"github.com/influxdata/influxdb/cmd/influx_tsm/tsdb"
+	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
 )
 
+// DefaultChunkSize is the size of chunks read from the bz1 shard
 const DefaultChunkSize = 1000
-
-var NoFieldsFiltered uint64
 
 // Reader is used to read all data from a bz1 shard.
 type Reader struct {
@@ -28,25 +29,32 @@ type Reader struct {
 	cursors    []*cursor
 	currCursor int
 
-	keyBuf    string
-	valuesBuf []tsm.Value
+	keyBuf   string
+	values   []tsm1.Value
+	valuePos int
 
-	series map[string]*tsdb.Series
 	fields map[string]*tsdb.MeasurementFields
 	codecs map[string]*tsdb.FieldCodec
 
-	ChunkSize int
+	stats *stats.Stats
 }
 
 // NewReader returns a reader for the bz1 shard at path.
-func NewReader(path string) *Reader {
-	return &Reader{
-		path:      path,
-		series:    make(map[string]*tsdb.Series),
-		fields:    make(map[string]*tsdb.MeasurementFields),
-		codecs:    make(map[string]*tsdb.FieldCodec),
-		ChunkSize: DefaultChunkSize,
+func NewReader(path string, stats *stats.Stats, chunkSize int) *Reader {
+	r := &Reader{
+		path:   path,
+		fields: make(map[string]*tsdb.MeasurementFields),
+		codecs: make(map[string]*tsdb.FieldCodec),
+		stats:  stats,
 	}
+
+	if chunkSize <= 0 {
+		chunkSize = DefaultChunkSize
+	}
+
+	r.values = make([]tsm1.Value, chunkSize)
+
+	return r
 }
 
 // Open opens the reader.
@@ -58,6 +66,8 @@ func (r *Reader) Open() error {
 	}
 	r.db = db
 
+	seriesSet := make(map[string]bool)
+
 	if err := r.db.View(func(tx *bolt.Tx) error {
 		var data []byte
 
@@ -66,20 +76,20 @@ func (r *Reader) Open() error {
 			// No data in this shard.
 			return nil
 		}
-		buf := meta.Get([]byte("series"))
-		if buf == nil {
-			// No data in this shard.
+
+		pointsBucket := tx.Bucket([]byte("points"))
+		if pointsBucket == nil {
 			return nil
 		}
-		data, err = snappy.Decode(nil, buf)
-		if err != nil {
-			return err
-		}
-		if err := json.Unmarshal(data, &r.series); err != nil {
+
+		if err := pointsBucket.ForEach(func(key, _ []byte) error {
+			seriesSet[string(key)] = true
+			return nil
+		}); err != nil {
 			return err
 		}
 
-		buf = meta.Get([]byte("fields"))
+		buf := meta.Get([]byte("fields"))
 		if buf == nil {
 			// No data in this shard.
 			return nil
@@ -102,20 +112,17 @@ func (r *Reader) Open() error {
 		r.codecs[k] = tsdb.NewFieldCodec(v.Fields)
 	}
 
-	// Create cursor for each field of each series.
 	r.tx, err = r.db.Begin(false)
 	if err != nil {
 		return err
 	}
-	for s, _ := range r.series {
-		if err != nil {
-			return err
-		}
 
+	// Create cursor for each field of each series.
+	for s := range seriesSet {
 		measurement := tsdb.MeasurementFromSeriesKey(s)
-		fields := r.fields[tsdb.MeasurementFromSeriesKey(s)]
+		fields := r.fields[measurement]
 		if fields == nil {
-			atomic.AddUint64(&NoFieldsFiltered, 1)
+			r.stats.IncrFiltered()
 			continue
 		}
 		for _, f := range fields.Fields {
@@ -134,30 +141,51 @@ func (r *Reader) Open() error {
 
 // Next returns whether there is any more data to be read.
 func (r *Reader) Next() bool {
+	r.valuePos = 0
+OUTER:
 	for {
-		if r.currCursor == len(r.cursors) {
+		if r.currCursor >= len(r.cursors) {
 			// All cursors drained. No more data remains.
 			return false
 		}
 
 		cc := r.cursors[r.currCursor]
-		k, v := cc.Next()
-		if k == -1 {
-			// Go to next cursor and try again.
-			r.currCursor++
-			if len(r.valuesBuf) == 0 {
-				// The previous cursor had no data. Instead of returning
-				// just go immediately to the next cursor.
-				continue
-			}
-			// There is some data available. Indicate that it should be read.
-			return true
-		}
+		r.keyBuf = tsm1.SeriesFieldKey(cc.series, cc.field)
 
-		r.keyBuf = tsm.SeriesFieldKey(cc.series, cc.field)
-		r.valuesBuf = append(r.valuesBuf, tsdb.ConvertToValue(k, v))
-		if len(r.valuesBuf) == r.ChunkSize {
-			return true
+		for {
+			k, v := cc.Next()
+			if k == -1 {
+				// Go to next cursor and try again.
+				r.currCursor++
+				if r.valuePos == 0 {
+					// The previous cursor had no data. Instead of returning
+					// just go immediately to the next cursor.
+					continue OUTER
+				}
+				// There is some data available. Indicate that it should be read.
+				return true
+			}
+
+			if f, ok := v.(float64); ok {
+				if math.IsInf(f, 0) {
+					r.stats.AddPointsRead(1)
+					r.stats.IncrInf()
+					continue
+				}
+
+				if math.IsNaN(f) {
+					r.stats.AddPointsRead(1)
+					r.stats.IncrNaN()
+					continue
+				}
+			}
+
+			r.values[r.valuePos] = tsm1.NewValue(k, v)
+			r.valuePos++
+
+			if r.valuePos >= len(r.values) {
+				return true
+			}
 		}
 	}
 }
@@ -165,17 +193,14 @@ func (r *Reader) Next() bool {
 // Read returns the next chunk of data in the shard, converted to tsm1 values. Data is
 // emitted completely for every field, in every series, before the next field is processed.
 // Data from Read() adheres to the requirements for writing to tsm1 shards
-func (r *Reader) Read() (string, []tsm.Value, error) {
-	defer func() {
-		r.valuesBuf = nil
-	}()
-
-	return r.keyBuf, r.valuesBuf, nil
+func (r *Reader) Read() (string, []tsm1.Value, error) {
+	return r.keyBuf, r.values[:r.valuePos], nil
 }
 
 // Close closes the reader.
 func (r *Reader) Close() error {
-	return r.tx.Rollback()
+	r.tx.Rollback()
+	return r.db.Close()
 }
 
 // cursor provides ordered iteration across a series.
@@ -213,24 +238,25 @@ func newCursor(tx *bolt.Tx, series string, field string, dec *tsdb.FieldCodec) *
 
 // Seek moves the cursor to a position.
 func (c *cursor) SeekTo(seek int64) {
-	seekBytes := u64tob(uint64(seek))
+	var seekBytes [8]byte
+	binary.BigEndian.PutUint64(seekBytes[:], uint64(seek))
 
 	// Move cursor to appropriate block and set to buffer.
-	k, v := c.cursor.Seek(seekBytes)
+	k, v := c.cursor.Seek(seekBytes[:])
 	if v == nil { // get the last block, it might have this time
 		_, v = c.cursor.Last()
-	} else if seek < int64(btou64(k)) { // the seek key is less than this block, go back one and check
+	} else if seek < int64(binary.BigEndian.Uint64(k)) { // the seek key is less than this block, go back one and check
 		_, v = c.cursor.Prev()
 
 		// if the previous block max time is less than the seek value, reset to where we were originally
-		if v == nil || seek > int64(btou64(v[0:8])) {
-			_, v = c.cursor.Seek(seekBytes)
+		if v == nil || seek > int64(binary.BigEndian.Uint64(v[0:8])) {
+			_, v = c.cursor.Seek(seekBytes[:])
 		}
 	}
 	c.setBuf(v)
 
 	// Read current block up to seek position.
-	c.seekBuf(seekBytes)
+	c.seekBuf(seekBytes[:])
 
 	// Return current entry.
 	c.keyBuf, c.valBuf = c.read()
@@ -332,17 +358,10 @@ type cursors []*cursor
 func (a cursors) Len() int      { return len(a) }
 func (a cursors) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 func (a cursors) Less(i, j int) bool {
-	return tsm.SeriesFieldKey(a[i].series, a[i].field) < tsm.SeriesFieldKey(a[j].series, a[j].field)
-}
-
-// btou64 converts an 8-byte slice into an uint64.
-func btou64(b []byte) uint64 { return binary.BigEndian.Uint64(b) }
-
-// u64tob converts a uint64 into an 8-byte slice.
-func u64tob(v uint64) []byte {
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, v)
-	return b
+	if a[i].series == a[j].series {
+		return a[i].field < a[j].field
+	}
+	return a[i].series < a[j].series
 }
 
 // entryHeaderSize is the number of bytes required for the header.

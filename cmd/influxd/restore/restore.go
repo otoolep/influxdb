@@ -1,3 +1,5 @@
+// Package restore is the restore subcommand for the influxd command,
+// for restoring from a backup.
 package restore
 
 import (
@@ -9,16 +11,15 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"sync"
 
-	"github.com/influxdb/influxdb/cmd/influxd/backup"
-	"github.com/influxdb/influxdb/services/meta"
-	"github.com/influxdb/influxdb/services/snapshotter"
+	"github.com/influxdata/influxdb/cmd/influxd/backup"
+	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/services/snapshotter"
 )
 
 // Command represents the program execution for "influxd restore".
@@ -49,11 +50,6 @@ func NewCommand() *Command {
 // Run executes the program.
 func (cmd *Command) Run(args ...string) error {
 	if err := cmd.parseFlags(args); err != nil {
-		return err
-	}
-
-	if err := cmd.ensureStopped(); err != nil {
-		fmt.Fprintln(cmd.Stderr, "influxd cannot be running during a restore.  Please stop any running instances and try again.")
 		return err
 	}
 
@@ -119,15 +115,6 @@ func (cmd *Command) parseFlags(args []string) error {
 	return nil
 }
 
-func (cmd *Command) ensureStopped() error {
-	ln, err := net.Listen("tcp", cmd.MetaConfig.BindAddress)
-	if err != nil {
-		return fmt.Errorf("influxd running on %s: aborting.", cmd.MetaConfig.BindAddress)
-	}
-	defer ln.Close()
-	return nil
-}
-
 // unpackMeta reads the metadata from the backup directory and initializes a raft
 // cluster and replaces the root metadata.
 func (cmd *Command) unpackMeta() error {
@@ -159,22 +146,22 @@ func (cmd *Command) unpackMeta() error {
 	var i int
 
 	// Make sure the file is actually a meta store backup file
-	magic := btou64(b[:8])
+	magic := binary.BigEndian.Uint64(b[:8])
 	if magic != snapshotter.BackupMagicHeader {
 		return fmt.Errorf("invalid metadata file")
 	}
 	i += 8
 
 	// Size of the meta store bytes
-	length := int(btou64(b[i : i+8]))
+	length := int(binary.BigEndian.Uint64(b[i : i+8]))
 	i += 8
 	metaBytes := b[i : i+length]
 	i += int(length)
 
 	// Size of the node.json bytes
-	length = int(btou64(b[i : i+8]))
+	length = int(binary.BigEndian.Uint64(b[i : i+8]))
 	i += 8
-	nodeBytes := b[i:]
+	nodeBytes := b[i : i+length]
 
 	// Unpack into metadata.
 	var data meta.Data
@@ -184,8 +171,7 @@ func (cmd *Command) unpackMeta() error {
 
 	// Copy meta config and remove peers so it starts in single mode.
 	c := cmd.MetaConfig
-	c.JoinPeers = nil
-	c.LoggingEnabled = false
+	c.Dir = cmd.metadir
 
 	// Create the meta dir
 	if os.MkdirAll(c.Dir, 0700); err != nil {
@@ -197,25 +183,7 @@ func (cmd *Command) unpackMeta() error {
 		return err
 	}
 
-	// Initialize meta store.
-	store := meta.NewService(c)
-	store.RaftListener = newNopListener()
-
-	// Open the meta store.
-	if err := store.Open(); err != nil {
-		return fmt.Errorf("open store: %s", err)
-	}
-	defer store.Close()
-
-	// Wait for the store to be ready or error.
-	select {
-	case err := <-store.Err():
-		return err
-	default:
-	}
-
-	client := meta.NewClient([]string{store.HTTPAddr()}, false)
-	client.SetLogger(log.New(ioutil.Discard, "", 0))
+	client := meta.NewClient(c)
 	if err := client.Open(); err != nil {
 		return err
 	}
@@ -225,6 +193,25 @@ func (cmd *Command) unpackMeta() error {
 	if err := client.SetData(&data); err != nil {
 		return fmt.Errorf("set data: %s", err)
 	}
+
+	// remove the raft.db file if it exists
+	err = os.Remove(filepath.Join(cmd.metadir, "raft.db"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	// remove the node.json file if it exists
+	err = os.Remove(filepath.Join(cmd.metadir, "node.json"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
 	return nil
 }
 
@@ -323,7 +310,8 @@ func (cmd *Command) unpackTar(tarFile string) error {
 
 // unpackFile will copy the current file from the tar archive to the data dir
 func (cmd *Command) unpackFile(tr *tar.Reader, fileName string) error {
-	fn := filepath.Join(cmd.datadir, fileName)
+	nativeFileName := filepath.FromSlash(fileName)
+	fn := filepath.Join(cmd.datadir, nativeFileName)
 	fmt.Printf("unpacking %s\n", fn)
 
 	if err := os.MkdirAll(filepath.Dir(fn), 0777); err != nil {
@@ -345,27 +333,26 @@ func (cmd *Command) unpackFile(tr *tar.Reader, fileName string) error {
 
 // printUsage prints the usage message to STDERR.
 func (cmd *Command) printUsage() {
-	fmt.Fprintf(cmd.Stdout, `usage: influxd restore [flags] PATH
-
-Restore uses backups from the PATH to restore the metastore, databases,
+	fmt.Fprintf(cmd.Stdout, `Uses backups from the PATH to restore the metastore, databases,
 retention policies, or specific shards. The InfluxDB process must not be
-running during restore.
+running during a restore.
 
-Options:
-  -metadir <path>
-        Optional. If set the metastore will be recovered to the given path.
-  -datadir <path>
-        Optional. If set the restore process will recover the specified
-        database, retention policy or shard to the given directory.
-  -database <name>
-        Optional. Required if no metadir given. Will restore the database
-        TSM files.
-  -retention <name>
-        Optional. If given, database is required. Will restore the retention policy's
-        TSM files.
-  -shard <id>
-    Optional. If given, database and retention are required. Will restore the shard's
-    TSM files.
+Usage: influxd restore [flags] PATH
+
+    -metadir <path>
+            Optional. If set the metastore will be recovered to the given path.
+    -datadir <path>
+            Optional. If set the restore process will recover the specified
+            database, retention policy or shard to the given directory.
+    -database <name>
+            Optional. Required if no metadir given. Will restore the database
+            TSM files.
+    -retention <name>
+            Optional. If given, database is required. Will restore the retention policy's
+            TSM files.
+    -shard <id>
+            Optional. If given, database and retention are required. Will restore the shard's
+            TSM files.
 
 `)
 }
@@ -399,14 +386,3 @@ func (ln *nopListener) Close() error {
 }
 
 func (ln *nopListener) Addr() net.Addr { return &net.TCPAddr{} }
-
-// u64tob converts a uint64 into an 8-byte slice.
-func u64tob(v uint64) []byte {
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, v)
-	return b
-}
-
-func btou64(b []byte) uint64 {
-	return binary.BigEndian.Uint64(b)
-}

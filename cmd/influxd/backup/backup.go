@@ -1,3 +1,4 @@
+// Package backup is the backup subcommand for the influxd command.
 package backup
 
 import (
@@ -15,8 +16,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/influxdb/influxdb/services/snapshotter"
-	"github.com/influxdb/influxdb/tcp"
+	"github.com/influxdata/influxdb/services/snapshotter"
+	"github.com/influxdata/influxdb/tcp"
 )
 
 const (
@@ -233,7 +234,7 @@ func (cmd *Command) backupMetastore() error {
 			return err
 		}
 
-		magic := btou64(binData[:8])
+		magic := binary.BigEndian.Uint64(binData[:8])
 		if magic != snapshotter.BackupMagicHeader {
 			cmd.Logger.Println("Invalid metadata blob, ensure the metadata service is running (default port 8088)")
 			return errors.New("invalid metadata received")
@@ -273,6 +274,16 @@ func (cmd *Command) downloadAndVerify(req *snapshotter.Request, path string, val
 		}
 	}
 
+	f, err := os.Stat(tmppath)
+	if err != nil {
+		return err
+	}
+
+	// There was nothing downloaded, don't create an empty backup file.
+	if f.Size() == 0 {
+		return os.Remove(tmppath)
+	}
+
 	// Rename temporary file to final path.
 	if err := os.Rename(tmppath, path); err != nil {
 		return fmt.Errorf("rename: %s", err)
@@ -290,24 +301,34 @@ func (cmd *Command) download(req *snapshotter.Request, path string) error {
 	}
 	defer f.Close()
 
-	// Connect to snapshotter service.
-	conn, err := tcp.Dial("tcp", cmd.host, snapshotter.MuxHeader)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
+	for i := 0; i < 10; i++ {
+		if err = func() error {
+			// Connect to snapshotter service.
+			conn, err := tcp.Dial("tcp", cmd.host, snapshotter.MuxHeader)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
 
-	// Write the request
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return fmt.Errorf("encode snapshot request: %s", err)
+			// Write the request
+			if err := json.NewEncoder(conn).Encode(req); err != nil {
+				return fmt.Errorf("encode snapshot request: %s", err)
+			}
+
+			// Read snapshot from the connection
+			if n, err := io.Copy(f, conn); err != nil || n == 0 {
+				return fmt.Errorf("copy backup to file: err=%v, n=%d", err, n)
+			}
+			return nil
+		}(); err == nil {
+			break
+		} else if err != nil {
+			cmd.Logger.Printf("Download shard %v failed %s.  Retrying (%d)...\n", req.ShardID, err, i)
+			time.Sleep(time.Second)
+		}
 	}
 
-	// Read snapshot from the connection
-	if _, err := io.Copy(f, conn); err != nil {
-		return fmt.Errorf("copy backup to file: %s", err)
-	}
-
-	return nil
+	return err
 }
 
 // requestInfo will request the database or retention policy information from the host
@@ -335,22 +356,21 @@ func (cmd *Command) requestInfo(request *snapshotter.Request) (*snapshotter.Resp
 
 // printUsage prints the usage message to STDERR.
 func (cmd *Command) printUsage() {
-	fmt.Fprintf(cmd.Stdout, `usage: influxd backup [flags] PATH
+	fmt.Fprintf(cmd.Stdout, `Downloads a snapshot of a data node and saves it to disk.
 
-Backup downloads a snapshot of a data node and saves it to disk.
+Usage: influxd backup [flags] PATH
 
-Options:
-  -host <host:port>
-        The host to connect to snapshot. Defaults to 127.0.0.1:8088.
-  -database <name>
-        The database to backup.
-  -retention <name>
-        Optional. The retention policy to backup.
-  -shard <id>
-        Optional. The shard id to backup. If specified, retention is required.
-  -since <2015-12-24T08:12:23>
-        Optional. Do an incremental backup since the passed in RFC3339
-        formatted time.
+    -host <host:port>
+            The host to connect to snapshot. Defaults to 127.0.0.1:8088.
+    -database <name>
+            The database to backup.
+    -retention <name>
+            Optional. The retention policy to backup.
+    -shard <id>
+            Optional. The shard id to backup. If specified, retention is required.
+    -since <2015-12-24T08:12:23>
+            Optional. Do an incremental backup since the passed in RFC3339
+            formatted time.
 
 `)
 }
@@ -364,8 +384,4 @@ func retentionAndShardFromPath(path string) (retention, shard string, err error)
 	}
 
 	return a[1], a[2], nil
-}
-
-func btou64(b []byte) uint64 {
-	return binary.BigEndian.Uint64(b)
 }

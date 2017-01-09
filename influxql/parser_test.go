@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdb/influxdb/influxql"
+	"github.com/influxdata/influxdb/influxql"
 )
 
 // Ensure the parser can parse a multi-statement query.
@@ -51,16 +51,24 @@ func TestParser_ParseQuery_ParseError(t *testing.T) {
 	}
 }
 
+func TestParser_ParseQuery_NoSemicolon(t *testing.T) {
+	_, err := influxql.NewParser(strings.NewReader(`CREATE DATABASE foo CREATE DATABASE bar`)).ParseQuery()
+	if err == nil || err.Error() != `found CREATE, expected ; at line 1, char 21` {
+		t.Fatalf("unexpected error: %s", err)
+	}
+}
+
 // Ensure the parser can parse strings into Statement ASTs.
 func TestParser_ParseStatement(t *testing.T) {
 	// For use in various tests.
 	now := time.Now()
 
 	var tests = []struct {
-		skip bool
-		s    string
-		stmt influxql.Statement
-		err  string
+		skip   bool
+		s      string
+		params map[string]interface{}
+		stmt   influxql.Statement
+		err    string
 	}{
 		// SELECT * statement
 		{
@@ -130,7 +138,7 @@ func TestParser_ParseStatement(t *testing.T) {
 					RHS: &influxql.BinaryExpr{
 						Op:  influxql.GT,
 						LHS: &influxql.VarRef{Val: "time"},
-						RHS: &influxql.TimeLiteral{Val: now.UTC()},
+						RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
 					},
 				},
 				Dimensions: []*influxql.Dimension{{Expr: &influxql.Call{Name: "time", Args: []influxql.Expr{&influxql.DurationLiteral{Val: 10 * time.Hour}}}}},
@@ -162,6 +170,18 @@ func TestParser_ParseStatement(t *testing.T) {
 			},
 		},
 
+		// sample
+		{
+			s: `SELECT sample(field1, 100) FROM myseries;`,
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: false,
+				Fields: []*influxql.Field{
+					{Expr: &influxql.Call{Name: "sample", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}, &influxql.IntegerLiteral{Val: 100}}}},
+				},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
+			},
+		},
+
 		// derivative
 		{
 			s: `SELECT derivative(field1, 1h) FROM myseries;`,
@@ -185,30 +205,355 @@ func TestParser_ParseStatement(t *testing.T) {
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.GT,
 					LHS: &influxql.VarRef{Val: "time"},
-					RHS: &influxql.TimeLiteral{Val: now.UTC()},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
 				},
 			},
 		},
 
 		{
-			s: `SELECT derivative(mean(field1), 1h) FROM myseries;`,
+			s: `SELECT derivative(field1, 1h) / derivative(field2, 1h) FROM myseries`,
 			stmt: &influxql.SelectStatement{
 				IsRawQuery: false,
 				Fields: []*influxql.Field{
-					{Expr: &influxql.Call{Name: "derivative", Args: []influxql.Expr{&influxql.Call{Name: "mean", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}}}, &influxql.DurationLiteral{Val: time.Hour}}}},
+					{
+						Expr: &influxql.BinaryExpr{
+							LHS: &influxql.Call{
+								Name: "derivative",
+								Args: []influxql.Expr{
+									&influxql.VarRef{Val: "field1"},
+									&influxql.DurationLiteral{Val: time.Hour},
+								},
+							},
+							RHS: &influxql.Call{
+								Name: "derivative",
+								Args: []influxql.Expr{
+									&influxql.VarRef{Val: "field2"},
+									&influxql.DurationLiteral{Val: time.Hour},
+								},
+							},
+							Op: influxql.DIV,
+						},
+					},
+				},
+				Sources: []influxql.Source{
+					&influxql.Measurement{Name: "myseries"},
+				},
+			},
+		},
+
+		// difference
+		{
+			s: `SELECT difference(field1) FROM myseries;`,
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: false,
+				Fields: []*influxql.Field{
+					{Expr: &influxql.Call{Name: "difference", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}}}},
 				},
 				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
 			},
 		},
 
 		{
-			s: `SELECT derivative(mean(field1)) FROM myseries;`,
+			s: fmt.Sprintf(`SELECT difference(max(field1)) FROM myseries WHERE time > '%s' GROUP BY time(1m)`, now.UTC().Format(time.RFC3339Nano)),
 			stmt: &influxql.SelectStatement{
 				IsRawQuery: false,
 				Fields: []*influxql.Field{
-					{Expr: &influxql.Call{Name: "derivative", Args: []influxql.Expr{&influxql.Call{Name: "mean", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}}}}}},
+					{
+						Expr: &influxql.Call{
+							Name: "difference",
+							Args: []influxql.Expr{
+								&influxql.Call{
+									Name: "max",
+									Args: []influxql.Expr{
+										&influxql.VarRef{Val: "field1"},
+									},
+								},
+							},
+						},
+					},
 				},
 				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
+				Dimensions: []*influxql.Dimension{
+					{
+						Expr: &influxql.Call{
+							Name: "time",
+							Args: []influxql.Expr{
+								&influxql.DurationLiteral{Val: time.Minute},
+							},
+						},
+					},
+				},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.GT,
+					LHS: &influxql.VarRef{Val: "time"},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
+				},
+			},
+		},
+
+		// moving_average
+		{
+			s: `SELECT moving_average(field1, 3) FROM myseries;`,
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: false,
+				Fields: []*influxql.Field{
+					{Expr: &influxql.Call{Name: "moving_average", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}, &influxql.IntegerLiteral{Val: 3}}}},
+				},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
+			},
+		},
+
+		{
+			s: fmt.Sprintf(`SELECT moving_average(max(field1), 3) FROM myseries WHERE time > '%s' GROUP BY time(1m)`, now.UTC().Format(time.RFC3339Nano)),
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: false,
+				Fields: []*influxql.Field{
+					{
+						Expr: &influxql.Call{
+							Name: "moving_average",
+							Args: []influxql.Expr{
+								&influxql.Call{
+									Name: "max",
+									Args: []influxql.Expr{
+										&influxql.VarRef{Val: "field1"},
+									},
+								},
+								&influxql.IntegerLiteral{Val: 3},
+							},
+						},
+					},
+				},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
+				Dimensions: []*influxql.Dimension{
+					{
+						Expr: &influxql.Call{
+							Name: "time",
+							Args: []influxql.Expr{
+								&influxql.DurationLiteral{Val: time.Minute},
+							},
+						},
+					},
+				},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.GT,
+					LHS: &influxql.VarRef{Val: "time"},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
+				},
+			},
+		},
+
+		// cumulative_sum
+		{
+			s: fmt.Sprintf(`SELECT cumulative_sum(field1) FROM myseries WHERE time > '%s'`, now.UTC().Format(time.RFC3339Nano)),
+			stmt: &influxql.SelectStatement{
+				Fields: []*influxql.Field{
+					{
+						Expr: &influxql.Call{
+							Name: "cumulative_sum",
+							Args: []influxql.Expr{
+								&influxql.VarRef{Val: "field1"},
+							},
+						},
+					},
+				},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.GT,
+					LHS: &influxql.VarRef{Val: "time"},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
+				},
+			},
+		},
+
+		{
+			s: fmt.Sprintf(`SELECT cumulative_sum(mean(field1)) FROM myseries WHERE time > '%s' GROUP BY time(1m)`, now.UTC().Format(time.RFC3339Nano)),
+			stmt: &influxql.SelectStatement{
+				Fields: []*influxql.Field{
+					{
+						Expr: &influxql.Call{
+							Name: "cumulative_sum",
+							Args: []influxql.Expr{
+								&influxql.Call{
+									Name: "mean",
+									Args: []influxql.Expr{
+										&influxql.VarRef{Val: "field1"},
+									},
+								},
+							},
+						},
+					},
+				},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
+				Dimensions: []*influxql.Dimension{
+					{
+						Expr: &influxql.Call{
+							Name: "time",
+							Args: []influxql.Expr{
+								&influxql.DurationLiteral{Val: time.Minute},
+							},
+						},
+					},
+				},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.GT,
+					LHS: &influxql.VarRef{Val: "time"},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
+				},
+			},
+		},
+
+		// holt_winters
+		{
+			s: fmt.Sprintf(`SELECT holt_winters(first(field1), 3, 1) FROM myseries WHERE time > '%s' GROUP BY time(1h);`, now.UTC().Format(time.RFC3339Nano)),
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: false,
+				Fields: []*influxql.Field{
+					{Expr: &influxql.Call{
+						Name: "holt_winters",
+						Args: []influxql.Expr{
+							&influxql.Call{
+								Name: "first",
+								Args: []influxql.Expr{
+									&influxql.VarRef{Val: "field1"},
+								},
+							},
+							&influxql.IntegerLiteral{Val: 3},
+							&influxql.IntegerLiteral{Val: 1},
+						},
+					}},
+				},
+				Dimensions: []*influxql.Dimension{
+					{
+						Expr: &influxql.Call{
+							Name: "time",
+							Args: []influxql.Expr{
+								&influxql.DurationLiteral{Val: 1 * time.Hour},
+							},
+						},
+					},
+				},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.GT,
+					LHS: &influxql.VarRef{Val: "time"},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
+				},
+			},
+		},
+
+		{
+			s: fmt.Sprintf(`SELECT holt_winters_with_fit(first(field1), 3, 1) FROM myseries WHERE time > '%s' GROUP BY time(1h);`, now.UTC().Format(time.RFC3339Nano)),
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: false,
+				Fields: []*influxql.Field{
+					{Expr: &influxql.Call{
+						Name: "holt_winters_with_fit",
+						Args: []influxql.Expr{
+							&influxql.Call{
+								Name: "first",
+								Args: []influxql.Expr{
+									&influxql.VarRef{Val: "field1"},
+								},
+							},
+							&influxql.IntegerLiteral{Val: 3},
+							&influxql.IntegerLiteral{Val: 1},
+						}}},
+				},
+				Dimensions: []*influxql.Dimension{
+					{
+						Expr: &influxql.Call{
+							Name: "time",
+							Args: []influxql.Expr{
+								&influxql.DurationLiteral{Val: 1 * time.Hour},
+							},
+						},
+					},
+				},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.GT,
+					LHS: &influxql.VarRef{Val: "time"},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
+				},
+			},
+		},
+		{
+			s: fmt.Sprintf(`SELECT holt_winters(max(field1), 4, 5) FROM myseries WHERE time > '%s' GROUP BY time(1m)`, now.UTC().Format(time.RFC3339Nano)),
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: false,
+				Fields: []*influxql.Field{
+					{
+						Expr: &influxql.Call{
+							Name: "holt_winters",
+							Args: []influxql.Expr{
+								&influxql.Call{
+									Name: "max",
+									Args: []influxql.Expr{
+										&influxql.VarRef{Val: "field1"},
+									},
+								},
+								&influxql.IntegerLiteral{Val: 4},
+								&influxql.IntegerLiteral{Val: 5},
+							},
+						},
+					},
+				},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
+				Dimensions: []*influxql.Dimension{
+					{
+						Expr: &influxql.Call{
+							Name: "time",
+							Args: []influxql.Expr{
+								&influxql.DurationLiteral{Val: time.Minute},
+							},
+						},
+					},
+				},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.GT,
+					LHS: &influxql.VarRef{Val: "time"},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
+				},
+			},
+		},
+
+		{
+			s: fmt.Sprintf(`SELECT holt_winters_with_fit(max(field1), 4, 5) FROM myseries WHERE time > '%s' GROUP BY time(1m)`, now.UTC().Format(time.RFC3339Nano)),
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: false,
+				Fields: []*influxql.Field{
+					{
+						Expr: &influxql.Call{
+							Name: "holt_winters_with_fit",
+							Args: []influxql.Expr{
+								&influxql.Call{
+									Name: "max",
+									Args: []influxql.Expr{
+										&influxql.VarRef{Val: "field1"},
+									},
+								},
+								&influxql.IntegerLiteral{Val: 4},
+								&influxql.IntegerLiteral{Val: 5},
+							},
+						},
+					},
+				},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "myseries"}},
+				Dimensions: []*influxql.Dimension{
+					{
+						Expr: &influxql.Call{
+							Name: "time",
+							Args: []influxql.Expr{
+								&influxql.DurationLiteral{Val: time.Minute},
+							},
+						},
+					},
+				},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.GT,
+					LHS: &influxql.VarRef{Val: "time"},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
+				},
 			},
 		},
 
@@ -296,13 +641,25 @@ func TestParser_ParseStatement(t *testing.T) {
 			},
 		},
 
+		{
+			s: `select percentile("field1", 2.0), field2 from cpu`,
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: false,
+				Fields: []*influxql.Field{
+					{Expr: &influxql.Call{Name: "percentile", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}, &influxql.NumberLiteral{Val: 2.0}}}},
+					{Expr: &influxql.VarRef{Val: "field2"}},
+				},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
+			},
+		},
+
 		// select top statements
 		{
 			s: `select top("field1", 2) from cpu`,
 			stmt: &influxql.SelectStatement{
 				IsRawQuery: false,
 				Fields: []*influxql.Field{
-					{Expr: &influxql.Call{Name: "top", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}, &influxql.NumberLiteral{Val: 2}}}},
+					{Expr: &influxql.Call{Name: "top", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}, &influxql.IntegerLiteral{Val: 2}}}},
 				},
 				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
 			},
@@ -313,7 +670,7 @@ func TestParser_ParseStatement(t *testing.T) {
 			stmt: &influxql.SelectStatement{
 				IsRawQuery: false,
 				Fields: []*influxql.Field{
-					{Expr: &influxql.Call{Name: "top", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}, &influxql.NumberLiteral{Val: 2}}}},
+					{Expr: &influxql.Call{Name: "top", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}, &influxql.IntegerLiteral{Val: 2}}}},
 				},
 				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
 			},
@@ -324,7 +681,7 @@ func TestParser_ParseStatement(t *testing.T) {
 			stmt: &influxql.SelectStatement{
 				IsRawQuery: false,
 				Fields: []*influxql.Field{
-					{Expr: &influxql.Call{Name: "top", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}, &influxql.NumberLiteral{Val: 2}}}},
+					{Expr: &influxql.Call{Name: "top", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}, &influxql.IntegerLiteral{Val: 2}}}},
 					{Expr: &influxql.VarRef{Val: "tag1"}},
 				},
 				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
@@ -336,7 +693,7 @@ func TestParser_ParseStatement(t *testing.T) {
 			stmt: &influxql.SelectStatement{
 				IsRawQuery: false,
 				Fields: []*influxql.Field{
-					{Expr: &influxql.Call{Name: "top", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}, &influxql.VarRef{Val: "tag1"}, &influxql.NumberLiteral{Val: 2}}}},
+					{Expr: &influxql.Call{Name: "top", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}, &influxql.VarRef{Val: "tag1"}, &influxql.IntegerLiteral{Val: 2}}}},
 					{Expr: &influxql.VarRef{Val: "tag1"}},
 				},
 				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
@@ -411,7 +768,7 @@ func TestParser_ParseStatement(t *testing.T) {
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.GT,
 					LHS: &influxql.VarRef{Val: "time"},
-					RHS: &influxql.TimeLiteral{Val: now.UTC()},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
 				},
 			},
 		},
@@ -426,7 +783,7 @@ func TestParser_ParseStatement(t *testing.T) {
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.GT,
 					LHS: &influxql.VarRef{Val: "load"},
-					RHS: &influxql.NumberLiteral{Val: 100},
+					RHS: &influxql.IntegerLiteral{Val: 100},
 				},
 			},
 		},
@@ -439,7 +796,7 @@ func TestParser_ParseStatement(t *testing.T) {
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.GTE,
 					LHS: &influxql.VarRef{Val: "load"},
-					RHS: &influxql.NumberLiteral{Val: 100},
+					RHS: &influxql.IntegerLiteral{Val: 100},
 				},
 			},
 		},
@@ -452,7 +809,7 @@ func TestParser_ParseStatement(t *testing.T) {
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.EQ,
 					LHS: &influxql.VarRef{Val: "load"},
-					RHS: &influxql.NumberLiteral{Val: 100},
+					RHS: &influxql.IntegerLiteral{Val: 100},
 				},
 			},
 		},
@@ -465,7 +822,7 @@ func TestParser_ParseStatement(t *testing.T) {
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.LTE,
 					LHS: &influxql.VarRef{Val: "load"},
-					RHS: &influxql.NumberLiteral{Val: 100},
+					RHS: &influxql.IntegerLiteral{Val: 100},
 				},
 			},
 		},
@@ -478,7 +835,7 @@ func TestParser_ParseStatement(t *testing.T) {
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.LT,
 					LHS: &influxql.VarRef{Val: "load"},
-					RHS: &influxql.NumberLiteral{Val: 100},
+					RHS: &influxql.IntegerLiteral{Val: 100},
 				},
 			},
 		},
@@ -491,7 +848,7 @@ func TestParser_ParseStatement(t *testing.T) {
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.NEQ,
 					LHS: &influxql.VarRef{Val: "load"},
-					RHS: &influxql.NumberLiteral{Val: 100},
+					RHS: &influxql.IntegerLiteral{Val: 100},
 				},
 			},
 		},
@@ -585,6 +942,23 @@ func TestParser_ParseStatement(t *testing.T) {
 				},
 			},
 		},
+		// SELECT statement with group by and multi digit duration (prevent regression from #731://github.com/influxdata/influxdb/pull/7316)
+		{
+			s: fmt.Sprintf(`SELECT count(value) FROM cpu where time < '%s' group by time(500ms)`, now.UTC().Format(time.RFC3339Nano)),
+			stmt: &influxql.SelectStatement{
+				Fields: []*influxql.Field{{
+					Expr: &influxql.Call{
+						Name: "count",
+						Args: []influxql.Expr{&influxql.VarRef{Val: "value"}}}}},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.LT,
+					LHS: &influxql.VarRef{Val: "time"},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
+				},
+				Dimensions: []*influxql.Dimension{{Expr: &influxql.Call{Name: "time", Args: []influxql.Expr{&influxql.DurationLiteral{Val: 500 * time.Millisecond}}}}},
+			},
+		},
 
 		// SELECT statement with fill
 		{
@@ -598,11 +972,11 @@ func TestParser_ParseStatement(t *testing.T) {
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.LT,
 					LHS: &influxql.VarRef{Val: "time"},
-					RHS: &influxql.TimeLiteral{Val: now.UTC()},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
 				},
 				Dimensions: []*influxql.Dimension{{Expr: &influxql.Call{Name: "time", Args: []influxql.Expr{&influxql.DurationLiteral{Val: 5 * time.Minute}}}}},
 				Fill:       influxql.NumberFill,
-				FillValue:  float64(1),
+				FillValue:  int64(1),
 			},
 		},
 
@@ -618,7 +992,7 @@ func TestParser_ParseStatement(t *testing.T) {
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.LT,
 					LHS: &influxql.VarRef{Val: "time"},
-					RHS: &influxql.TimeLiteral{Val: now.UTC()},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
 				},
 				Dimensions: []*influxql.Dimension{{Expr: &influxql.Call{Name: "time", Args: []influxql.Expr{&influxql.DurationLiteral{Val: 5 * time.Minute}}}}},
 				Fill:       influxql.NoFill,
@@ -637,15 +1011,100 @@ func TestParser_ParseStatement(t *testing.T) {
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.LT,
 					LHS: &influxql.VarRef{Val: "time"},
-					RHS: &influxql.TimeLiteral{Val: now.UTC()},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
 				},
 				Dimensions: []*influxql.Dimension{{Expr: &influxql.Call{Name: "time", Args: []influxql.Expr{&influxql.DurationLiteral{Val: 5 * time.Minute}}}}},
 				Fill:       influxql.PreviousFill,
 			},
 		},
 
-		// See issues https://github.com/influxdb/influxdb/issues/1647
-		// and https://github.com/influxdb/influxdb/issues/4404
+		// SELECT statement with average fill
+		{
+			s: fmt.Sprintf(`SELECT mean(value) FROM cpu where time < '%s' GROUP BY time(5m) FILL(linear)`, now.UTC().Format(time.RFC3339Nano)),
+			stmt: &influxql.SelectStatement{
+				Fields: []*influxql.Field{{
+					Expr: &influxql.Call{
+						Name: "mean",
+						Args: []influxql.Expr{&influxql.VarRef{Val: "value"}}}}},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.LT,
+					LHS: &influxql.VarRef{Val: "time"},
+					RHS: &influxql.StringLiteral{Val: now.UTC().Format(time.RFC3339Nano)},
+				},
+				Dimensions: []*influxql.Dimension{{Expr: &influxql.Call{Name: "time", Args: []influxql.Expr{&influxql.DurationLiteral{Val: 5 * time.Minute}}}}},
+				Fill:       influxql.LinearFill,
+			},
+		},
+
+		// SELECT casts
+		{
+			s: `SELECT field1::float, field2::integer, field3::string, field4::boolean, field5::field, tag1::tag FROM cpu`,
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: true,
+				Fields: []*influxql.Field{
+					{
+						Expr: &influxql.VarRef{
+							Val:  "field1",
+							Type: influxql.Float,
+						},
+					},
+					{
+						Expr: &influxql.VarRef{
+							Val:  "field2",
+							Type: influxql.Integer,
+						},
+					},
+					{
+						Expr: &influxql.VarRef{
+							Val:  "field3",
+							Type: influxql.String,
+						},
+					},
+					{
+						Expr: &influxql.VarRef{
+							Val:  "field4",
+							Type: influxql.Boolean,
+						},
+					},
+					{
+						Expr: &influxql.VarRef{
+							Val:  "field5",
+							Type: influxql.AnyField,
+						},
+					},
+					{
+						Expr: &influxql.VarRef{
+							Val:  "tag1",
+							Type: influxql.Tag,
+						},
+					},
+				},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
+			},
+		},
+
+		// SELECT statement with a bound parameter
+		{
+			s: `SELECT value FROM cpu WHERE value > $value`,
+			params: map[string]interface{}{
+				"value": int64(2),
+			},
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: true,
+				Fields: []*influxql.Field{{
+					Expr: &influxql.VarRef{Val: "value"}}},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.GT,
+					LHS: &influxql.VarRef{Val: "value"},
+					RHS: &influxql.IntegerLiteral{Val: 2},
+				},
+			},
+		},
+
+		// See issues https://github.com/influxdata/influxdb/issues/1647
+		// and https://github.com/influxdata/influxdb/issues/4404
 		// DELETE statement
 		//{
 		//	s: `DELETE FROM myseries WHERE host = 'hosta.influxdb.org'`,
@@ -658,12 +1117,6 @@ func TestParser_ParseStatement(t *testing.T) {
 		//		},
 		//	},
 		//},
-
-		// SHOW SERVERS
-		{
-			s:    `SHOW SERVERS`,
-			stmt: &influxql.ShowServersStatement{},
-		},
 
 		// SHOW GRANTS
 		{
@@ -688,6 +1141,14 @@ func TestParser_ParseStatement(t *testing.T) {
 			s: `SHOW SERIES FROM cpu`,
 			stmt: &influxql.ShowSeriesStatement{
 				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
+			},
+		},
+
+		// SHOW SERIES ON db0
+		{
+			s: `SHOW SERIES ON db0`,
+			stmt: &influxql.ShowSeriesStatement{
+				Database: "db0",
 			},
 		},
 
@@ -753,6 +1214,14 @@ func TestParser_ParseStatement(t *testing.T) {
 			},
 		},
 
+		// SHOW MEASUREMENTS ON db0
+		{
+			s: `SHOW MEASUREMENTS ON db0`,
+			stmt: &influxql.ShowMeasurementsStatement{
+				Database: "db0",
+			},
+		},
+
 		// SHOW MEASUREMENTS WITH MEASUREMENT = cpu
 		{
 			s: `SHOW MEASUREMENTS WITH MEASUREMENT = cpu`,
@@ -771,11 +1240,40 @@ func TestParser_ParseStatement(t *testing.T) {
 			},
 		},
 
+		// SHOW QUERIES
+		{
+			s:    `SHOW QUERIES`,
+			stmt: &influxql.ShowQueriesStatement{},
+		},
+
+		// KILL QUERY 4
+		{
+			s: `KILL QUERY 4`,
+			stmt: &influxql.KillQueryStatement{
+				QueryID: 4,
+			},
+		},
+
+		// KILL QUERY 4 ON localhost
+		{
+			s: `KILL QUERY 4 ON localhost`,
+			stmt: &influxql.KillQueryStatement{
+				QueryID: 4,
+				Host:    "localhost",
+			},
+		},
+
 		// SHOW RETENTION POLICIES
 		{
-			s: `SHOW RETENTION POLICIES ON mydb`,
+			s:    `SHOW RETENTION POLICIES`,
+			stmt: &influxql.ShowRetentionPoliciesStatement{},
+		},
+
+		// SHOW RETENTION POLICIES ON db0
+		{
+			s: `SHOW RETENTION POLICIES ON db0`,
 			stmt: &influxql.ShowRetentionPoliciesStatement{
-				Database: "mydb",
+				Database: "db0",
 			},
 		},
 
@@ -784,6 +1282,14 @@ func TestParser_ParseStatement(t *testing.T) {
 			s: `SHOW TAG KEYS FROM src`,
 			stmt: &influxql.ShowTagKeysStatement{
 				Sources: []influxql.Source{&influxql.Measurement{Name: "src"}},
+			},
+		},
+
+		// SHOW TAG KEYS ON db0
+		{
+			s: `SHOW TAG KEYS ON db0`,
+			stmt: &influxql.ShowTagKeysStatement{
+				Database: "db0",
 			},
 		},
 
@@ -892,8 +1398,9 @@ func TestParser_ParseStatement(t *testing.T) {
 			skip: true,
 			s:    `SHOW TAG VALUES FROM src WITH KEY = region WHERE region = 'uswest' ORDER BY ASC, field1, field2 DESC LIMIT 10`,
 			stmt: &influxql.ShowTagValuesStatement{
-				Sources: []influxql.Source{&influxql.Measurement{Name: "src"}},
-				TagKeys: []string{"region"},
+				Sources:    []influxql.Source{&influxql.Measurement{Name: "src"}},
+				Op:         influxql.EQ,
+				TagKeyExpr: &influxql.StringLiteral{Val: "region"},
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.EQ,
 					LHS: &influxql.VarRef{Val: "region"},
@@ -912,8 +1419,9 @@ func TestParser_ParseStatement(t *testing.T) {
 		{
 			s: `SHOW TAG VALUES FROM cpu WITH KEY IN (region, host) WHERE region = 'uswest'`,
 			stmt: &influxql.ShowTagValuesStatement{
-				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
-				TagKeys: []string{"region", "host"},
+				Sources:    []influxql.Source{&influxql.Measurement{Name: "cpu"}},
+				Op:         influxql.IN,
+				TagKeyExpr: &influxql.ListLiteral{Vals: []string{"region", "host"}},
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.EQ,
 					LHS: &influxql.VarRef{Val: "region"},
@@ -926,8 +1434,9 @@ func TestParser_ParseStatement(t *testing.T) {
 		{
 			s: `SHOW TAG VALUES FROM cpu WITH KEY IN (region,service,host)WHERE region = 'uswest'`,
 			stmt: &influxql.ShowTagValuesStatement{
-				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
-				TagKeys: []string{"region", "service", "host"},
+				Sources:    []influxql.Source{&influxql.Measurement{Name: "cpu"}},
+				Op:         influxql.IN,
+				TagKeyExpr: &influxql.ListLiteral{Vals: []string{"region", "service", "host"}},
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.EQ,
 					LHS: &influxql.VarRef{Val: "region"},
@@ -940,7 +1449,8 @@ func TestParser_ParseStatement(t *testing.T) {
 		{
 			s: `SHOW TAG VALUES WITH KEY = host WHERE region = 'uswest'`,
 			stmt: &influxql.ShowTagValuesStatement{
-				TagKeys: []string{"host"},
+				Op:         influxql.EQ,
+				TagKeyExpr: &influxql.StringLiteral{Val: "host"},
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.EQ,
 					LHS: &influxql.VarRef{Val: "region"},
@@ -958,7 +1468,8 @@ func TestParser_ParseStatement(t *testing.T) {
 						Regex: &influxql.RegexLiteral{Val: regexp.MustCompile(`[cg]pu`)},
 					},
 				},
-				TagKeys: []string{"host"},
+				Op:         influxql.EQ,
+				TagKeyExpr: &influxql.StringLiteral{Val: "host"},
 			},
 		},
 
@@ -966,12 +1477,32 @@ func TestParser_ParseStatement(t *testing.T) {
 		{
 			s: `SHOW TAG VALUES WITH KEY = "host" WHERE region = 'uswest'`,
 			stmt: &influxql.ShowTagValuesStatement{
-				TagKeys: []string{`host`},
+				Op:         influxql.EQ,
+				TagKeyExpr: &influxql.StringLiteral{Val: `host`},
 				Condition: &influxql.BinaryExpr{
 					Op:  influxql.EQ,
 					LHS: &influxql.VarRef{Val: "region"},
 					RHS: &influxql.StringLiteral{Val: "uswest"},
 				},
+			},
+		},
+
+		// SHOW TAG VALUES WITH KEY =~ /<regex>/
+		{
+			s: `SHOW TAG VALUES WITH KEY =~ /(host|region)/`,
+			stmt: &influxql.ShowTagValuesStatement{
+				Op:         influxql.EQREGEX,
+				TagKeyExpr: &influxql.RegexLiteral{Val: regexp.MustCompile(`(host|region)`)},
+			},
+		},
+
+		// SHOW TAG VALUES ON db0
+		{
+			s: `SHOW TAG VALUES ON db0 WITH KEY = "host"`,
+			stmt: &influxql.ShowTagValuesStatement{
+				Database:   "db0",
+				Op:         influxql.EQ,
+				TagKeyExpr: &influxql.StringLiteral{Val: "host"},
 			},
 		},
 
@@ -1005,6 +1536,39 @@ func TestParser_ParseStatement(t *testing.T) {
 				},
 			},
 		},
+		{
+			s: `SHOW FIELD KEYS ON db0`,
+			stmt: &influxql.ShowFieldKeysStatement{
+				Database: "db0",
+			},
+		},
+
+		// DELETE statement
+		{
+			s:    `DELETE FROM src`,
+			stmt: &influxql.DeleteSeriesStatement{Sources: []influxql.Source{&influxql.Measurement{Name: "src"}}},
+		},
+		{
+			s: `DELETE WHERE host = 'hosta.influxdb.org'`,
+			stmt: &influxql.DeleteSeriesStatement{
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.EQ,
+					LHS: &influxql.VarRef{Val: "host"},
+					RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
+				},
+			},
+		},
+		{
+			s: `DELETE FROM src WHERE host = 'hosta.influxdb.org'`,
+			stmt: &influxql.DeleteSeriesStatement{
+				Sources: []influxql.Source{&influxql.Measurement{Name: "src"}},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.EQ,
+					LHS: &influxql.VarRef{Val: "host"},
+					RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
+				},
+			},
+		},
 
 		// DROP SERIES statement
 		{
@@ -1031,16 +1595,6 @@ func TestParser_ParseStatement(t *testing.T) {
 					RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
 				},
 			},
-		},
-
-		// DROP SERVER statement
-		{
-			s:    `DROP META SERVER 123`,
-			stmt: &influxql.DropServerStatement{NodeID: 123, Meta: true},
-		},
-		{
-			s:    `DROP DATA SERVER 123`,
-			stmt: &influxql.DropServerStatement{NodeID: 123, Meta: false},
 		},
 
 		// SHOW CONTINUOUS QUERIES statement
@@ -1228,105 +1782,61 @@ func TestParser_ParseStatement(t *testing.T) {
 		{
 			s: `CREATE DATABASE testdb`,
 			stmt: &influxql.CreateDatabaseStatement{
-				Name:                  "testdb",
-				IfNotExists:           false,
-				RetentionPolicyCreate: false,
-			},
-		},
-		{
-			s: `CREATE DATABASE IF NOT EXISTS testdb`,
-			stmt: &influxql.CreateDatabaseStatement{
-				Name:                  "testdb",
-				IfNotExists:           true,
+				Name: "testdb",
 				RetentionPolicyCreate: false,
 			},
 		},
 		{
 			s: `CREATE DATABASE testdb WITH DURATION 24h`,
 			stmt: &influxql.CreateDatabaseStatement{
-				Name:                       "testdb",
-				IfNotExists:                false,
-				RetentionPolicyCreate:      true,
-				RetentionPolicyDuration:    24 * time.Hour,
-				RetentionPolicyReplication: 1,
-				RetentionPolicyName:        "default",
+				Name: "testdb",
+				RetentionPolicyCreate:   true,
+				RetentionPolicyDuration: duration(24 * time.Hour),
 			},
 		},
 		{
-			s: `CREATE DATABASE IF NOT EXISTS testdb WITH DURATION 24h`,
+			s: `CREATE DATABASE testdb WITH SHARD DURATION 30m`,
 			stmt: &influxql.CreateDatabaseStatement{
-				Name:                       "testdb",
-				IfNotExists:                true,
-				RetentionPolicyCreate:      true,
-				RetentionPolicyDuration:    24 * time.Hour,
-				RetentionPolicyReplication: 1,
-				RetentionPolicyName:        "default",
+				Name: "testdb",
+				RetentionPolicyCreate:             true,
+				RetentionPolicyShardGroupDuration: 30 * time.Minute,
 			},
 		},
 		{
 			s: `CREATE DATABASE testdb WITH REPLICATION 2`,
 			stmt: &influxql.CreateDatabaseStatement{
-				Name:                       "testdb",
-				IfNotExists:                false,
+				Name: "testdb",
 				RetentionPolicyCreate:      true,
-				RetentionPolicyDuration:    0,
-				RetentionPolicyReplication: 2,
-				RetentionPolicyName:        "default",
-			},
-		},
-		{
-			s: `CREATE DATABASE IF NOT EXISTS testdb WITH REPLICATION 2`,
-			stmt: &influxql.CreateDatabaseStatement{
-				Name:                       "testdb",
-				IfNotExists:                true,
-				RetentionPolicyCreate:      true,
-				RetentionPolicyDuration:    0,
-				RetentionPolicyReplication: 2,
-				RetentionPolicyName:        "default",
+				RetentionPolicyReplication: intptr(2),
 			},
 		},
 		{
 			s: `CREATE DATABASE testdb WITH NAME test_name`,
 			stmt: &influxql.CreateDatabaseStatement{
-				Name:                       "testdb",
-				IfNotExists:                false,
-				RetentionPolicyCreate:      true,
-				RetentionPolicyDuration:    0,
-				RetentionPolicyReplication: 1,
-				RetentionPolicyName:        "test_name",
-			},
-		},
-		{
-			s: `CREATE DATABASE IF NOT EXISTS testdb WITH NAME test_name`,
-			stmt: &influxql.CreateDatabaseStatement{
-				Name:                       "testdb",
-				IfNotExists:                true,
-				RetentionPolicyCreate:      true,
-				RetentionPolicyDuration:    0,
-				RetentionPolicyReplication: 1,
-				RetentionPolicyName:        "test_name",
+				Name: "testdb",
+				RetentionPolicyCreate: true,
+				RetentionPolicyName:   "test_name",
 			},
 		},
 		{
 			s: `CREATE DATABASE testdb WITH DURATION 24h REPLICATION 2 NAME test_name`,
 			stmt: &influxql.CreateDatabaseStatement{
-				Name:                       "testdb",
-				IfNotExists:                false,
+				Name: "testdb",
 				RetentionPolicyCreate:      true,
-				RetentionPolicyDuration:    24 * time.Hour,
-				RetentionPolicyReplication: 2,
+				RetentionPolicyDuration:    duration(24 * time.Hour),
+				RetentionPolicyReplication: intptr(2),
 				RetentionPolicyName:        "test_name",
 			},
 		},
 		{
-			s: `CREATE DATABASE IF NOT EXISTS testdb WITH DURATION 24h REPLICATION 2 NAME test_name`,
+			s: `CREATE DATABASE testdb WITH DURATION 24h REPLICATION 2 SHARD DURATION 10m NAME test_name `,
 			stmt: &influxql.CreateDatabaseStatement{
-				Name:                       "testdb",
-				IfNotExists:                true,
-				RetentionPolicyCreate:      true,
-				RetentionPolicyDuration:    24 * time.Hour,
-				RetentionPolicyReplication: 2,
-				RetentionPolicyName:        "test_name",
+				Name: "testdb",
+				RetentionPolicyCreate:             true,
+				RetentionPolicyDuration:           duration(24 * time.Hour),
+				RetentionPolicyReplication:        intptr(2),
+				RetentionPolicyName:               "test_name",
+				RetentionPolicyShardGroupDuration: 10 * time.Minute,
 			},
 		},
 
@@ -1368,15 +1878,7 @@ func TestParser_ParseStatement(t *testing.T) {
 		{
 			s: `DROP DATABASE testdb`,
 			stmt: &influxql.DropDatabaseStatement{
-				Name:     "testdb",
-				IfExists: false,
-			},
-		},
-		{
-			s: `DROP DATABASE IF EXISTS testdb`,
-			stmt: &influxql.DropDatabaseStatement{
-				Name:     "testdb",
-				IfExists: true,
+				Name: "testdb",
 			},
 		},
 
@@ -1546,46 +2048,92 @@ func TestParser_ParseStatement(t *testing.T) {
 				Default:     true,
 			},
 		},
+		// CREATE RETENTION POLICY
+		{
+			s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION 2 SHARD DURATION 30m`,
+			stmt: &influxql.CreateRetentionPolicyStatement{
+				Name:               "policy1",
+				Database:           "testdb",
+				Duration:           time.Hour,
+				Replication:        2,
+				ShardGroupDuration: 30 * time.Minute,
+			},
+		},
+		{
+			s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION 2 SHARD DURATION 0s`,
+			stmt: &influxql.CreateRetentionPolicyStatement{
+				Name:               "policy1",
+				Database:           "testdb",
+				Duration:           time.Hour,
+				Replication:        2,
+				ShardGroupDuration: 0,
+			},
+		},
+		{
+			s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION 2 SHARD DURATION 1s`,
+			stmt: &influxql.CreateRetentionPolicyStatement{
+				Name:               "policy1",
+				Database:           "testdb",
+				Duration:           time.Hour,
+				Replication:        2,
+				ShardGroupDuration: time.Second,
+			},
+		},
 
 		// ALTER RETENTION POLICY
 		{
 			s:    `ALTER RETENTION POLICY policy1 ON testdb DURATION 1m REPLICATION 4 DEFAULT`,
-			stmt: newAlterRetentionPolicyStatement("policy1", "testdb", time.Minute, 4, true),
+			stmt: newAlterRetentionPolicyStatement("policy1", "testdb", time.Minute, -1, 4, true),
 		},
 
 		// ALTER RETENTION POLICY with options in reverse order
 		{
 			s:    `ALTER RETENTION POLICY policy1 ON testdb DEFAULT REPLICATION 4 DURATION 1m`,
-			stmt: newAlterRetentionPolicyStatement("policy1", "testdb", time.Minute, 4, true),
+			stmt: newAlterRetentionPolicyStatement("policy1", "testdb", time.Minute, -1, 4, true),
 		},
 
 		// ALTER RETENTION POLICY with infinite retention
 		{
 			s:    `ALTER RETENTION POLICY policy1 ON testdb DEFAULT REPLICATION 4 DURATION INF`,
-			stmt: newAlterRetentionPolicyStatement("policy1", "testdb", 0, 4, true),
+			stmt: newAlterRetentionPolicyStatement("policy1", "testdb", 0, -1, 4, true),
 		},
 
 		// ALTER RETENTION POLICY without optional DURATION
 		{
 			s:    `ALTER RETENTION POLICY policy1 ON testdb DEFAULT REPLICATION 4`,
-			stmt: newAlterRetentionPolicyStatement("policy1", "testdb", -1, 4, true),
+			stmt: newAlterRetentionPolicyStatement("policy1", "testdb", -1, -1, 4, true),
 		},
 
 		// ALTER RETENTION POLICY without optional REPLICATION
 		{
 			s:    `ALTER RETENTION POLICY policy1 ON testdb DEFAULT`,
-			stmt: newAlterRetentionPolicyStatement("policy1", "testdb", -1, -1, true),
+			stmt: newAlterRetentionPolicyStatement("policy1", "testdb", -1, -1, -1, true),
 		},
 
 		// ALTER RETENTION POLICY without optional DEFAULT
 		{
 			s:    `ALTER RETENTION POLICY policy1 ON testdb REPLICATION 4`,
-			stmt: newAlterRetentionPolicyStatement("policy1", "testdb", -1, 4, false),
+			stmt: newAlterRetentionPolicyStatement("policy1", "testdb", -1, -1, 4, false),
 		},
 		// ALTER default retention policy unquoted
 		{
 			s:    `ALTER RETENTION POLICY default ON testdb REPLICATION 4`,
-			stmt: newAlterRetentionPolicyStatement("default", "testdb", -1, 4, false),
+			stmt: newAlterRetentionPolicyStatement("default", "testdb", -1, -1, 4, false),
+		},
+		// ALTER RETENTION POLICY with SHARD duration
+		{
+			s:    `ALTER RETENTION POLICY policy1 ON testdb REPLICATION 4 SHARD DURATION 10m`,
+			stmt: newAlterRetentionPolicyStatement("policy1", "testdb", -1, 10*time.Minute, 4, false),
+		},
+		// ALTER RETENTION POLICY with all options
+		{
+			s:    `ALTER RETENTION POLICY default ON testdb DURATION 0s REPLICATION 4 SHARD DURATION 10m DEFAULT`,
+			stmt: newAlterRetentionPolicyStatement("default", "testdb", time.Duration(0), 10*time.Minute, 4, true),
+		},
+		// ALTER RETENTION POLICY with 0s shard duration
+		{
+			s:    `ALTER RETENTION POLICY default ON testdb DURATION 0s REPLICATION 1 SHARD DURATION 0s`,
+			stmt: newAlterRetentionPolicyStatement("default", "testdb", time.Duration(0), 0, 1, false),
 		},
 
 		// SHOW STATS
@@ -1655,32 +2203,51 @@ func TestParser_ParseStatement(t *testing.T) {
 		},
 
 		// Errors
-		{s: ``, err: `found EOF, expected SELECT, DELETE, SHOW, CREATE, DROP, GRANT, REVOKE, ALTER, SET at line 1, char 1`},
+		{s: ``, err: `found EOF, expected SELECT, DELETE, SHOW, CREATE, DROP, GRANT, REVOKE, ALTER, SET, KILL at line 1, char 1`},
 		{s: `SELECT`, err: `found EOF, expected identifier, string, number, bool at line 1, char 8`},
 		{s: `SELECT time FROM myseries`, err: `at least 1 non-time field must be queried`},
-		{s: `blah blah`, err: `found blah, expected SELECT, DELETE, SHOW, CREATE, DROP, GRANT, REVOKE, ALTER, SET at line 1, char 1`},
+		{s: `blah blah`, err: `found blah, expected SELECT, DELETE, SHOW, CREATE, DROP, GRANT, REVOKE, ALTER, SET, KILL at line 1, char 1`},
 		{s: `SELECT field1 X`, err: `found X, expected FROM at line 1, char 15`},
 		{s: `SELECT field1 FROM "series" WHERE X +;`, err: `found ;, expected identifier, string, number, bool at line 1, char 38`},
 		{s: `SELECT field1 FROM myseries GROUP`, err: `found EOF, expected BY at line 1, char 35`},
-		{s: `SELECT field1 FROM myseries LIMIT`, err: `found EOF, expected number at line 1, char 35`},
-		{s: `SELECT field1 FROM myseries LIMIT 10.5`, err: `fractional parts not allowed in LIMIT at line 1, char 35`},
+		{s: `SELECT field1 FROM myseries LIMIT`, err: `found EOF, expected integer at line 1, char 35`},
+		{s: `SELECT field1 FROM myseries LIMIT 10.5`, err: `found 10.5, expected integer at line 1, char 35`},
+		{s: `SELECT count(max(value)) FROM myseries`, err: `expected field argument in count()`},
+		{s: `SELECT count(distinct('value')) FROM myseries`, err: `expected field argument in distinct()`},
+		{s: `SELECT distinct('value') FROM myseries`, err: `expected field argument in distinct()`},
+		{s: `SELECT min(max(value)) FROM myseries`, err: `expected field argument in min()`},
+		{s: `SELECT min(distinct(value)) FROM myseries`, err: `expected field argument in min()`},
+		{s: `SELECT max(max(value)) FROM myseries`, err: `expected field argument in max()`},
+		{s: `SELECT sum(max(value)) FROM myseries`, err: `expected field argument in sum()`},
+		{s: `SELECT first(max(value)) FROM myseries`, err: `expected field argument in first()`},
+		{s: `SELECT last(max(value)) FROM myseries`, err: `expected field argument in last()`},
+		{s: `SELECT mean(max(value)) FROM myseries`, err: `expected field argument in mean()`},
+		{s: `SELECT median(max(value)) FROM myseries`, err: `expected field argument in median()`},
+		{s: `SELECT mode(max(value)) FROM myseries`, err: `expected field argument in mode()`},
+		{s: `SELECT stddev(max(value)) FROM myseries`, err: `expected field argument in stddev()`},
+		{s: `SELECT spread(max(value)) FROM myseries`, err: `expected field argument in spread()`},
 		{s: `SELECT top() FROM myseries`, err: `invalid number of arguments for top, expected at least 2, got 0`},
 		{s: `SELECT top(field1) FROM myseries`, err: `invalid number of arguments for top, expected at least 2, got 1`},
 		{s: `SELECT top(field1,foo) FROM myseries`, err: `expected integer as last argument in top(), found foo`},
 		{s: `SELECT top(field1,host,'server',foo) FROM myseries`, err: `expected integer as last argument in top(), found foo`},
-		{s: `SELECT top(field1,5,'server',2) FROM myseries`, err: `only fields or tags are allowed in top(), found 5.000`},
+		{s: `SELECT top(field1,5,'server',2) FROM myseries`, err: `only fields or tags are allowed in top(), found 5`},
 		{s: `SELECT top(field1,max(foo),'server',2) FROM myseries`, err: `only fields or tags are allowed in top(), found max(foo)`},
+		{s: `SELECT top(value, 10) + count(value) FROM myseries`, err: `cannot use top() inside of a binary expression`},
+		{s: `SELECT top(max(value), 10) FROM myseries`, err: `only fields or tags are allowed in top(), found max(value)`},
 		{s: `SELECT bottom() FROM myseries`, err: `invalid number of arguments for bottom, expected at least 2, got 0`},
 		{s: `SELECT bottom(field1) FROM myseries`, err: `invalid number of arguments for bottom, expected at least 2, got 1`},
 		{s: `SELECT bottom(field1,foo) FROM myseries`, err: `expected integer as last argument in bottom(), found foo`},
 		{s: `SELECT bottom(field1,host,'server',foo) FROM myseries`, err: `expected integer as last argument in bottom(), found foo`},
-		{s: `SELECT bottom(field1,5,'server',2) FROM myseries`, err: `only fields or tags are allowed in bottom(), found 5.000`},
+		{s: `SELECT bottom(field1,5,'server',2) FROM myseries`, err: `only fields or tags are allowed in bottom(), found 5`},
 		{s: `SELECT bottom(field1,max(foo),'server',2) FROM myseries`, err: `only fields or tags are allowed in bottom(), found max(foo)`},
+		{s: `SELECT bottom(value, 10) + count(value) FROM myseries`, err: `cannot use bottom() inside of a binary expression`},
+		{s: `SELECT bottom(max(value), 10) FROM myseries`, err: `only fields or tags are allowed in bottom(), found max(value)`},
 		{s: `SELECT percentile() FROM myseries`, err: `invalid number of arguments for percentile, expected 2, got 0`},
 		{s: `SELECT percentile(field1) FROM myseries`, err: `invalid number of arguments for percentile, expected 2, got 1`},
 		{s: `SELECT percentile(field1, foo) FROM myseries`, err: `expected float argument in percentile()`},
-		{s: `SELECT field1 FROM myseries OFFSET`, err: `found EOF, expected number at line 1, char 36`},
-		{s: `SELECT field1 FROM myseries OFFSET 10.5`, err: `fractional parts not allowed in OFFSET at line 1, char 36`},
+		{s: `SELECT percentile(max(field1), 75) FROM myseries`, err: `expected field argument in percentile()`},
+		{s: `SELECT field1 FROM myseries OFFSET`, err: `found EOF, expected integer at line 1, char 36`},
+		{s: `SELECT field1 FROM myseries OFFSET 10.5`, err: `found 10.5, expected integer at line 1, char 36`},
 		{s: `SELECT field1 FROM myseries ORDER`, err: `found EOF, expected BY at line 1, char 35`},
 		{s: `SELECT field1 FROM myseries ORDER BY`, err: `found EOF, expected identifier, ASC, DESC at line 1, char 38`},
 		{s: `SELECT field1 FROM myseries ORDER BY /`, err: `found /, expected identifier, ASC, DESC at line 1, char 38`},
@@ -1692,14 +2259,16 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `SELECT count(value), value FROM foo`, err: `mixing aggregate and non-aggregate queries is not supported`},
 		{s: `SELECT count(value)/10, value FROM foo`, err: `mixing aggregate and non-aggregate queries is not supported`},
 		{s: `SELECT count(value) FROM foo group by time(1s)`, err: `aggregate functions with GROUP BY time require a WHERE time clause`},
+		{s: `SELECT count(value) FROM foo group by time(500ms)`, err: `aggregate functions with GROUP BY time require a WHERE time clause`},
 		{s: `SELECT count(value) FROM foo group by time(1s) where host = 'hosta.influxdb.org'`, err: `aggregate functions with GROUP BY time require a WHERE time clause`},
 		{s: `SELECT count(value) FROM foo group by time`, err: `time() is a function and expects at least one argument`},
 		{s: `SELECT count(value) FROM foo group by 'time'`, err: `only time and tag dimensions allowed`},
-		{s: `SELECT count(value) FROM foo where time > now() and time < now() group by time()`, err: `time dimension expected one argument`},
-		{s: `SELECT count(value) FROM foo where time > now() and time < now() group by time(b)`, err: `time dimension must have one duration argument`},
+		{s: `SELECT count(value) FROM foo where time > now() and time < now() group by time()`, err: `time dimension expected 1 or 2 arguments`},
+		{s: `SELECT count(value) FROM foo where time > now() and time < now() group by time(b)`, err: `time dimension must have duration argument`},
 		{s: `SELECT count(value) FROM foo where time > now() and time < now() group by time(1s), time(2s)`, err: `multiple time dimensions not allowed`},
+		{s: `SELECT count(value) FROM foo where time > now() and time < now() group by time(1s, b)`, err: `time dimension offset must be duration or now()`},
 		{s: `SELECT field1 FROM 12`, err: `found 12, expected identifier at line 1, char 20`},
-		{s: `SELECT 1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 FROM myseries`, err: `unable to parse number at line 1, char 8`},
+		{s: `SELECT 1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 FROM myseries`, err: `unable to parse integer at line 1, char 8`},
 		{s: `SELECT 10.5h FROM myseries`, err: `found h, expected FROM at line 1, char 12`},
 		{s: `SELECT distinct(field1), sum(field1) FROM myseries`, err: `aggregate function distinct() can not be combined with other functions or fields`},
 		{s: `SELECT distinct(field1), field2 FROM myseries`, err: `aggregate function distinct() can not be combined with other functions or fields`},
@@ -1719,6 +2288,7 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `SELECT derivative(bottom(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for bottom, expected at least 2, got 1`},
 		{s: `SELECT derivative(max()) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for max, expected 1, got 0`},
 		{s: `SELECT derivative(percentile(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for percentile, expected 2, got 1`},
+		{s: `SELECT derivative(mean(value), 1h) FROM myseries where time < now() and time > now() - 1d`, err: `derivative aggregate requires a GROUP BY interval`},
 		{s: `SELECT non_negative_derivative(), field1 FROM myseries`, err: `mixing aggregate and non-aggregate queries is not supported`},
 		{s: `select non_negative_derivative() from myseries`, err: `invalid number of arguments for non_negative_derivative, expected at least 1 but no more than 2, got 0`},
 		{s: `select non_negative_derivative(mean(value), 1h, 3) from myseries`, err: `invalid number of arguments for non_negative_derivative, expected at least 1 but no more than 2, got 3`},
@@ -1726,33 +2296,74 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `SELECT non_negative_derivative(top(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for top, expected at least 2, got 1`},
 		{s: `SELECT non_negative_derivative(bottom(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for bottom, expected at least 2, got 1`},
 		{s: `SELECT non_negative_derivative(max()) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for max, expected 1, got 0`},
+		{s: `SELECT non_negative_derivative(mean(value), 1h) FROM myseries where time < now() and time > now() - 1d`, err: `non_negative_derivative aggregate requires a GROUP BY interval`},
 		{s: `SELECT non_negative_derivative(percentile(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for percentile, expected 2, got 1`},
+		{s: `SELECT difference(), field1 FROM myseries`, err: `mixing aggregate and non-aggregate queries is not supported`},
+		{s: `SELECT difference() from myseries`, err: `invalid number of arguments for difference, expected 1, got 0`},
+		{s: `SELECT difference(value) FROM myseries group by time(1h)`, err: `aggregate function required inside the call to difference`},
+		{s: `SELECT difference(top(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for top, expected at least 2, got 1`},
+		{s: `SELECT difference(bottom(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for bottom, expected at least 2, got 1`},
+		{s: `SELECT difference(max()) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for max, expected 1, got 0`},
+		{s: `SELECT difference(percentile(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for percentile, expected 2, got 1`},
+		{s: `SELECT difference(mean(value)) FROM myseries where time < now() and time > now() - 1d`, err: `difference aggregate requires a GROUP BY interval`},
+		{s: `SELECT moving_average(), field1 FROM myseries`, err: `mixing aggregate and non-aggregate queries is not supported`},
+		{s: `SELECT moving_average() from myseries`, err: `invalid number of arguments for moving_average, expected 2, got 0`},
+		{s: `SELECT moving_average(value) FROM myseries`, err: `invalid number of arguments for moving_average, expected 2, got 1`},
+		{s: `SELECT moving_average(value, 2) FROM myseries group by time(1h)`, err: `aggregate function required inside the call to moving_average`},
+		{s: `SELECT moving_average(top(value), 2) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for top, expected at least 2, got 1`},
+		{s: `SELECT moving_average(bottom(value), 2) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for bottom, expected at least 2, got 1`},
+		{s: `SELECT moving_average(max(), 2) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for max, expected 1, got 0`},
+		{s: `SELECT moving_average(percentile(value), 2) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for percentile, expected 2, got 1`},
+		{s: `SELECT moving_average(mean(value), 2) FROM myseries where time < now() and time > now() - 1d`, err: `moving_average aggregate requires a GROUP BY interval`},
+		{s: `SELECT cumulative_sum(), field1 FROM myseries`, err: `mixing aggregate and non-aggregate queries is not supported`},
+		{s: `SELECT cumulative_sum() from myseries`, err: `invalid number of arguments for cumulative_sum, expected 1, got 0`},
+		{s: `SELECT cumulative_sum(value) FROM myseries group by time(1h)`, err: `aggregate function required inside the call to cumulative_sum`},
+		{s: `SELECT cumulative_sum(top(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for top, expected at least 2, got 1`},
+		{s: `SELECT cumulative_sum(bottom(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for bottom, expected at least 2, got 1`},
+		{s: `SELECT cumulative_sum(max()) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for max, expected 1, got 0`},
+		{s: `SELECT cumulative_sum(percentile(value)) FROM myseries where time < now() and time > now() - 1d group by time(1h)`, err: `invalid number of arguments for percentile, expected 2, got 1`},
+		{s: `SELECT cumulative_sum(mean(value)) FROM myseries where time < now() and time > now() - 1d`, err: `cumulative_sum aggregate requires a GROUP BY interval`},
+		{s: `SELECT holt_winters(value) FROM myseries where time < now() and time > now() - 1d`, err: `invalid number of arguments for holt_winters, expected 3, got 1`},
+		{s: `SELECT holt_winters(value, 10, 2) FROM myseries where time < now() and time > now() - 1d`, err: `must use aggregate function with holt_winters`},
+		{s: `SELECT holt_winters(min(value), 10, 2) FROM myseries where time < now() and time > now() - 1d`, err: `holt_winters aggregate requires a GROUP BY interval`},
+		{s: `SELECT holt_winters(min(value), 0, 2) FROM myseries where time < now() and time > now() - 1d GROUP BY time(1d)`, err: `second arg to holt_winters must be greater than 0, got 0`},
+		{s: `SELECT holt_winters(min(value), false, 2) FROM myseries where time < now() and time > now() - 1d GROUP BY time(1d)`, err: `expected integer argument as second arg in holt_winters`},
+		{s: `SELECT holt_winters(min(value), 10, 'string') FROM myseries where time < now() and time > now() - 1d GROUP BY time(1d)`, err: `expected integer argument as third arg in holt_winters`},
 		{s: `SELECT field1 from myseries WHERE host =~ 'asd' LIMIT 1`, err: `found asd, expected regex at line 1, char 42`},
 		{s: `SELECT value > 2 FROM cpu`, err: `invalid operator > in SELECT clause at line 1, char 8; operator is intended for WHERE clause`},
 		{s: `SELECT value = 2 FROM cpu`, err: `invalid operator = in SELECT clause at line 1, char 8; operator is intended for WHERE clause`},
 		{s: `SELECT s =~ /foo/ FROM cpu`, err: `invalid operator =~ in SELECT clause at line 1, char 8; operator is intended for WHERE clause`},
-		// See issues https://github.com/influxdb/influxdb/issues/1647
-		// and https://github.com/influxdb/influxdb/issues/4404
+		{s: `SELECT mean(value) + value FROM cpu WHERE time < now() and time > now() - 1h GROUP BY time(10m)`, err: `binary expressions cannot mix aggregates and raw fields`},
+		// TODO: Remove this restriction in the future: https://github.com/influxdata/influxdb/issues/5968
+		{s: `SELECT mean(cpu_total - cpu_idle) FROM cpu`, err: `expected field argument in mean()`},
+		{s: `SELECT derivative(mean(cpu_total - cpu_idle), 1s) FROM cpu WHERE time < now() AND time > now() - 1d GROUP BY time(1h)`, err: `expected field argument in mean()`},
+		// TODO: The error message will change when math is allowed inside an aggregate: https://github.com/influxdata/influxdb/pull/5990#issuecomment-195565870
+		{s: `SELECT count(foo + sum(bar)) FROM cpu`, err: `expected field argument in count()`},
+		{s: `SELECT (count(foo + sum(bar))) FROM cpu`, err: `expected field argument in count()`},
+		{s: `SELECT sum(value) + count(foo + sum(bar)) FROM cpu`, err: `binary expressions cannot mix aggregates and raw fields`},
+		{s: `SELECT mean(value) FROM cpu FILL + value`, err: `fill must be a function call`},
+		// See issues https://github.com/influxdata/influxdb/issues/1647
+		// and https://github.com/influxdata/influxdb/issues/4404
 		//{s: `DELETE`, err: `found EOF, expected FROM at line 1, char 8`},
 		//{s: `DELETE FROM`, err: `found EOF, expected identifier at line 1, char 13`},
 		//{s: `DELETE FROM myseries WHERE`, err: `found EOF, expected identifier, string, number, bool at line 1, char 28`},
-		{s: `DELETE`, err: `DELETE FROM is currently not supported. Use DROP SERIES or DROP MEASUREMENT instead`},
-		{s: `DELETE FROM`, err: `DELETE FROM is currently not supported. Use DROP SERIES or DROP MEASUREMENT instead`},
-		{s: `DELETE FROM myseries WHERE`, err: `DELETE FROM is currently not supported. Use DROP SERIES or DROP MEASUREMENT instead`},
+		{s: `DELETE`, err: `found EOF, expected FROM, WHERE at line 1, char 8`},
+		{s: `DELETE FROM`, err: `found EOF, expected identifier at line 1, char 13`},
+		{s: `DELETE FROM myseries WHERE`, err: `found EOF, expected identifier, string, number, bool at line 1, char 28`},
+		{s: `DELETE FROM "foo".myseries`, err: `retention policy not supported at line 1, char 1`},
+		{s: `DELETE FROM foo..myseries`, err: `database not supported at line 1, char 1`},
 		{s: `DROP MEASUREMENT`, err: `found EOF, expected identifier at line 1, char 18`},
 		{s: `DROP SERIES`, err: `found EOF, expected FROM, WHERE at line 1, char 13`},
 		{s: `DROP SERIES FROM`, err: `found EOF, expected identifier at line 1, char 18`},
 		{s: `DROP SERIES FROM src WHERE`, err: `found EOF, expected identifier, string, number, bool at line 1, char 28`},
-		{s: `DROP META SERVER`, err: `found EOF, expected number at line 1, char 18`},
-		{s: `DROP DATA SERVER abc`, err: `found abc, expected number at line 1, char 18`},
+		{s: `DROP SERIES FROM "foo".myseries`, err: `retention policy not supported at line 1, char 1`},
+		{s: `DROP SERIES FROM foo..myseries`, err: `database not supported at line 1, char 1`},
 		{s: `SHOW CONTINUOUS`, err: `found EOF, expected QUERIES at line 1, char 17`},
 		{s: `SHOW RETENTION`, err: `found EOF, expected POLICIES at line 1, char 16`},
 		{s: `SHOW RETENTION ON`, err: `found ON, expected POLICIES at line 1, char 16`},
-		{s: `SHOW RETENTION POLICIES`, err: `found EOF, expected ON at line 1, char 25`},
-		{s: `SHOW RETENTION POLICIES mydb`, err: `found mydb, expected ON at line 1, char 25`},
 		{s: `SHOW RETENTION POLICIES ON`, err: `found EOF, expected identifier at line 1, char 28`},
 		{s: `SHOW SHARD`, err: `found EOF, expected GROUPS at line 1, char 12`},
-		{s: `SHOW FOO`, err: `found FOO, expected CONTINUOUS, DATABASES, DIAGNOSTICS, FIELD, GRANTS, MEASUREMENTS, RETENTION, SERIES, SERVERS, SHARD, SHARDS, STATS, SUBSCRIPTIONS, TAG, USERS at line 1, char 6`},
+		{s: `SHOW FOO`, err: `found FOO, expected CONTINUOUS, DATABASES, DIAGNOSTICS, FIELD, GRANTS, MEASUREMENTS, QUERIES, RETENTION, SERIES, SHARD, SHARDS, STATS, SUBSCRIPTIONS, TAG, USERS at line 1, char 6`},
 		{s: `SHOW STATS FOR`, err: `found EOF, expected string at line 1, char 16`},
 		{s: `SHOW DIAGNOSTICS FOR`, err: `found EOF, expected string at line 1, char 22`},
 		{s: `SHOW GRANTS`, err: `found EOF, expected FOR at line 1, char 13`},
@@ -1765,23 +2376,15 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `CREATE CONTINUOUS QUERY`, err: `found EOF, expected identifier at line 1, char 25`},
 		{s: `CREATE CONTINUOUS QUERY cq ON db RESAMPLE FOR 5s BEGIN SELECT mean(value) INTO cpu_mean FROM cpu GROUP BY time(10s) END`, err: `FOR duration must be >= GROUP BY time duration: must be a minimum of 10s, got 5s`},
 		{s: `CREATE CONTINUOUS QUERY cq ON db RESAMPLE EVERY 10s FOR 5s BEGIN SELECT mean(value) INTO cpu_mean FROM cpu GROUP BY time(5s) END`, err: `FOR duration must be >= GROUP BY time duration: must be a minimum of 10s, got 5s`},
-		{s: `DROP FOO`, err: `found FOO, expected SERIES, CONTINUOUS, MEASUREMENT, SERVER, SUBSCRIPTION at line 1, char 6`},
+		{s: `DROP FOO`, err: `found FOO, expected CONTINUOUS, MEASUREMENT, RETENTION, SERIES, SHARD, SUBSCRIPTION, USER at line 1, char 6`},
 		{s: `CREATE FOO`, err: `found FOO, expected CONTINUOUS, DATABASE, USER, RETENTION, SUBSCRIPTION at line 1, char 8`},
 		{s: `CREATE DATABASE`, err: `found EOF, expected identifier at line 1, char 17`},
-		{s: `CREATE DATABASE "testdb" WITH`, err: `found EOF, expected DURATION, REPLICATION, NAME at line 1, char 31`},
+		{s: `CREATE DATABASE "testdb" WITH`, err: `found EOF, expected DURATION, NAME, REPLICATION, SHARD at line 1, char 31`},
 		{s: `CREATE DATABASE "testdb" WITH DURATION`, err: `found EOF, expected duration at line 1, char 40`},
-		{s: `CREATE DATABASE "testdb" WITH REPLICATION`, err: `found EOF, expected number at line 1, char 43`},
+		{s: `CREATE DATABASE "testdb" WITH REPLICATION`, err: `found EOF, expected integer at line 1, char 43`},
 		{s: `CREATE DATABASE "testdb" WITH NAME`, err: `found EOF, expected identifier at line 1, char 36`},
-		{s: `CREATE DATABASE IF`, err: `found EOF, expected NOT at line 1, char 20`},
-		{s: `CREATE DATABASE IF NOT`, err: `found EOF, expected EXISTS at line 1, char 24`},
-		{s: `CREATE DATABASE IF NOT EXISTS`, err: `found EOF, expected identifier at line 1, char 31`},
-		{s: `CREATE DATABASE IF NOT EXISTS "testdb" WITH`, err: `found EOF, expected DURATION, REPLICATION, NAME at line 1, char 45`},
-		{s: `CREATE DATABASE IF NOT EXISTS "testdb" WITH DURATION`, err: `found EOF, expected duration at line 1, char 54`},
-		{s: `CREATE DATABASE IF NOT EXISTS "testdb" WITH REPLICATION`, err: `found EOF, expected number at line 1, char 57`},
-		{s: `CREATE DATABASE IF NOT EXISTS "testdb" WITH NAME`, err: `found EOF, expected identifier at line 1, char 50`},
+		{s: `CREATE DATABASE "testdb" WITH SHARD`, err: `found EOF, expected DURATION at line 1, char 37`},
 		{s: `DROP DATABASE`, err: `found EOF, expected identifier at line 1, char 15`},
-		{s: `DROP DATABASE IF`, err: `found EOF, expected EXISTS at line 1, char 18`},
-		{s: `DROP DATABASE IF EXISTS`, err: `found EOF, expected identifier at line 1, char 25`},
 		{s: `DROP RETENTION`, err: `found EOF, expected POLICY at line 1, char 16`},
 		{s: `DROP RETENTION POLICY`, err: `found EOF, expected identifier at line 1, char 23`},
 		{s: `DROP RETENTION POLICY "1h.cpu"`, err: `found EOF, expected ON at line 1, char 31`},
@@ -1837,6 +2440,9 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `GRANT ALL PRIVILEGES ON testdb TO`, err: `found EOF, expected identifier at line 1, char 35`},
 		{s: `GRANT ALL TO`, err: `found EOF, expected identifier at line 1, char 14`},
 		{s: `GRANT ALL PRIVILEGES TO`, err: `found EOF, expected identifier at line 1, char 25`},
+		{s: `KILL`, err: `found EOF, expected QUERY at line 1, char 6`},
+		{s: `KILL QUERY 10s`, err: `found 10s, expected integer at line 1, char 12`},
+		{s: `KILL QUERY 4 ON 'host'`, err: `found host, expected identifier at line 1, char 16`},
 		{s: `REVOKE`, err: `found EOF, expected READ, WRITE, ALL [PRIVILEGES] at line 1, char 8`},
 		{s: `REVOKE BOGUS`, err: `found BOGUS, expected READ, WRITE, ALL [PRIVILEGES] at line 1, char 8`},
 		{s: `REVOKE READ`, err: `found EOF, expected ON at line 1, char 13`},
@@ -1877,16 +2483,19 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION`, err: `found EOF, expected duration at line 1, char 52`},
 		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION bad`, err: `found bad, expected duration at line 1, char 52`},
 		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h`, err: `found EOF, expected REPLICATION at line 1, char 54`},
-		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION`, err: `found EOF, expected number at line 1, char 67`},
-		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION 3.14`, err: `number must be an integer at line 1, char 67`},
+		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION`, err: `found EOF, expected integer at line 1, char 67`},
+		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION 3.14`, err: `found 3.14, expected integer at line 1, char 67`},
 		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION 0`, err: `invalid value 0: must be 1 <= n <= 2147483647 at line 1, char 67`},
-		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION bad`, err: `found bad, expected number at line 1, char 67`},
-		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION 1 foo`, err: `found foo, expected DEFAULT at line 1, char 69`},
+		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION bad`, err: `found bad, expected integer at line 1, char 67`},
+		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION 2 SHARD DURATION INF`, err: `invalid duration INF for shard duration at line 1, char 84`},
 		{s: `ALTER`, err: `found EOF, expected RETENTION at line 1, char 7`},
 		{s: `ALTER RETENTION`, err: `found EOF, expected POLICY at line 1, char 17`},
 		{s: `ALTER RETENTION POLICY`, err: `found EOF, expected identifier at line 1, char 24`},
 		{s: `ALTER RETENTION POLICY policy1`, err: `found EOF, expected ON at line 1, char 32`}, {s: `ALTER RETENTION POLICY policy1 ON`, err: `found EOF, expected identifier at line 1, char 35`},
-		{s: `ALTER RETENTION POLICY policy1 ON testdb`, err: `found EOF, expected DURATION, RETENTION, DEFAULT at line 1, char 42`},
+		{s: `ALTER RETENTION POLICY policy1 ON testdb`, err: `found EOF, expected DURATION, REPLICATION, SHARD, DEFAULT at line 1, char 42`},
+		{s: `ALTER RETENTION POLICY policy1 ON testdb REPLICATION 1 REPLICATION 2`, err: `found duplicate REPLICATION option at line 1, char 56`},
+		{s: `ALTER RETENTION POLICY policy1 ON testdb DURATION 15251w`, err: `overflowed duration 15251w: choose a smaller duration or INF at line 1, char 51`},
+		{s: `ALTER RETENTION POLICY policy1 ON testdb DURATION INF SHARD DURATION INF`, err: `invalid duration INF for shard duration at line 1, char 70`},
 		{s: `SET`, err: `found EOF, expected PASSWORD at line 1, char 5`},
 		{s: `SET PASSWORD`, err: `found EOF, expected FOR at line 1, char 14`},
 		{s: `SET PASSWORD something`, err: `found something, expected FOR at line 1, char 14`},
@@ -1894,14 +2503,19 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `SET PASSWORD FOR dejan`, err: `found EOF, expected = at line 1, char 24`},
 		{s: `SET PASSWORD FOR dejan =`, err: `found EOF, expected string at line 1, char 25`},
 		{s: `SET PASSWORD FOR dejan = bla`, err: `found bla, expected string at line 1, char 26`},
+		{s: `$SHOW$DATABASES`, err: `found $SHOW, expected SELECT, DELETE, SHOW, CREATE, DROP, GRANT, REVOKE, ALTER, SET, KILL at line 1, char 1`},
+		{s: `SELECT * FROM cpu WHERE "tagkey" = $$`, err: `empty bound parameter`},
 	}
 
 	for i, tt := range tests {
 		if tt.skip {
-			t.Logf("skipping test of '%s'", tt.s)
 			continue
 		}
-		stmt, err := influxql.NewParser(strings.NewReader(tt.s)).ParseStatement()
+		p := influxql.NewParser(strings.NewReader(tt.s))
+		if tt.params != nil {
+			p.SetParams(tt.params)
+		}
+		stmt, err := p.ParseStatement()
 
 		// We are memoizing a field so for testing we need to...
 		if s, ok := tt.stmt.(*influxql.SelectStatement); ok {
@@ -1914,10 +2528,28 @@ func TestParser_ParseStatement(t *testing.T) {
 
 		if !reflect.DeepEqual(tt.err, errstring(err)) {
 			t.Errorf("%d. %q: error mismatch:\n  exp=%s\n  got=%s\n\n", i, tt.s, tt.err, err)
-		} else if tt.err == "" && !reflect.DeepEqual(tt.stmt, stmt) {
-			t.Logf("\n# %s\nexp=%s\ngot=%s\n", tt.s, mustMarshalJSON(tt.stmt), mustMarshalJSON(stmt))
-			t.Logf("\nSQL exp=%s\nSQL got=%s\n", tt.stmt.String(), stmt.String())
-			t.Errorf("%d. %q\n\nstmt mismatch:\n\nexp=%#v\n\ngot=%#v\n\n", i, tt.s, tt.stmt, stmt)
+		} else if tt.err == "" {
+			if !reflect.DeepEqual(tt.stmt, stmt) {
+				t.Logf("\n# %s\nexp=%s\ngot=%s\n", tt.s, mustMarshalJSON(tt.stmt), mustMarshalJSON(stmt))
+				t.Logf("\nSQL exp=%s\nSQL got=%s\n", tt.stmt.String(), stmt.String())
+				t.Errorf("%d. %q\n\nstmt mismatch:\n\nexp=%#v\n\ngot=%#v\n\n", i, tt.s, tt.stmt, stmt)
+			} else {
+				// Attempt to reparse the statement as a string and confirm it parses the same.
+				// Skip this if we have some kind of statement with a password since those will never be reparsed.
+				switch stmt.(type) {
+				case *influxql.CreateUserStatement, *influxql.SetPasswordUserStatement:
+					continue
+				}
+
+				stmt2, err := influxql.ParseStatement(stmt.String())
+				if err != nil {
+					t.Errorf("%d. %q: unable to parse statement string: %s", i, stmt.String(), err)
+				} else if !reflect.DeepEqual(tt.stmt, stmt2) {
+					t.Logf("\n# %s\nexp=%s\ngot=%s\n", tt.s, mustMarshalJSON(tt.stmt), mustMarshalJSON(stmt2))
+					t.Logf("\nSQL exp=%s\nSQL got=%s\n", tt.stmt.String(), stmt2.String())
+					t.Errorf("%d. %q\n\nstmt reparse mismatch:\n\nexp=%#v\n\ngot=%#v\n\n", i, tt.s, tt.stmt, stmt2)
+				}
+			}
 		}
 	}
 }
@@ -1930,24 +2562,22 @@ func TestParser_ParseExpr(t *testing.T) {
 		err  string
 	}{
 		// Primitives
-		{s: `100`, expr: &influxql.NumberLiteral{Val: 100}},
+		{s: `100.0`, expr: &influxql.NumberLiteral{Val: 100}},
+		{s: `100`, expr: &influxql.IntegerLiteral{Val: 100}},
 		{s: `'foo bar'`, expr: &influxql.StringLiteral{Val: "foo bar"}},
 		{s: `true`, expr: &influxql.BooleanLiteral{Val: true}},
 		{s: `false`, expr: &influxql.BooleanLiteral{Val: false}},
 		{s: `my_ident`, expr: &influxql.VarRef{Val: "my_ident"}},
-		{s: `'2000-01-01 00:00:00'`, expr: &influxql.TimeLiteral{Val: mustParseTime("2000-01-01T00:00:00Z")}},
-		{s: `'2000-01-01 00:00:00.232'`, expr: &influxql.TimeLiteral{Val: mustParseTime("2000-01-01T00:00:00.232Z")}},
-		{s: `'2000-01-32 00:00:00'`, err: `unable to parse datetime at line 1, char 1`},
-		{s: `'2000-01-01'`, expr: &influxql.TimeLiteral{Val: mustParseTime("2000-01-01T00:00:00Z")}},
-		{s: `'2000-01-99'`, err: `unable to parse date at line 1, char 1`},
+		{s: `'2000-01-01 00:00:00'`, expr: &influxql.StringLiteral{Val: "2000-01-01 00:00:00"}},
+		{s: `'2000-01-01'`, expr: &influxql.StringLiteral{Val: "2000-01-01"}},
 
 		// Simple binary expression
 		{
 			s: `1 + 2`,
 			expr: &influxql.BinaryExpr{
 				Op:  influxql.ADD,
-				LHS: &influxql.NumberLiteral{Val: 1},
-				RHS: &influxql.NumberLiteral{Val: 2},
+				LHS: &influxql.IntegerLiteral{Val: 1},
+				RHS: &influxql.IntegerLiteral{Val: 2},
 			},
 		},
 
@@ -1958,10 +2588,10 @@ func TestParser_ParseExpr(t *testing.T) {
 				Op: influxql.ADD,
 				LHS: &influxql.BinaryExpr{
 					Op:  influxql.MUL,
-					LHS: &influxql.NumberLiteral{Val: 1},
-					RHS: &influxql.NumberLiteral{Val: 2},
+					LHS: &influxql.IntegerLiteral{Val: 1},
+					RHS: &influxql.IntegerLiteral{Val: 2},
 				},
-				RHS: &influxql.NumberLiteral{Val: 3},
+				RHS: &influxql.IntegerLiteral{Val: 3},
 			},
 		},
 
@@ -1970,11 +2600,11 @@ func TestParser_ParseExpr(t *testing.T) {
 			s: `1 + 2 * 3`,
 			expr: &influxql.BinaryExpr{
 				Op:  influxql.ADD,
-				LHS: &influxql.NumberLiteral{Val: 1},
+				LHS: &influxql.IntegerLiteral{Val: 1},
 				RHS: &influxql.BinaryExpr{
 					Op:  influxql.MUL,
-					LHS: &influxql.NumberLiteral{Val: 2},
-					RHS: &influxql.NumberLiteral{Val: 3},
+					LHS: &influxql.IntegerLiteral{Val: 2},
+					RHS: &influxql.IntegerLiteral{Val: 3},
 				},
 			},
 		},
@@ -1987,11 +2617,11 @@ func TestParser_ParseExpr(t *testing.T) {
 				LHS: &influxql.ParenExpr{
 					Expr: &influxql.BinaryExpr{
 						Op:  influxql.ADD,
-						LHS: &influxql.NumberLiteral{Val: 1},
-						RHS: &influxql.NumberLiteral{Val: 2},
+						LHS: &influxql.IntegerLiteral{Val: 1},
+						RHS: &influxql.IntegerLiteral{Val: 2},
 					},
 				},
-				RHS: &influxql.NumberLiteral{Val: 3},
+				RHS: &influxql.IntegerLiteral{Val: 3},
 			},
 		},
 
@@ -2002,10 +2632,10 @@ func TestParser_ParseExpr(t *testing.T) {
 				Op: influxql.MUL,
 				LHS: &influxql.BinaryExpr{
 					Op:  influxql.MUL,
-					LHS: &influxql.NumberLiteral{Val: 1},
-					RHS: &influxql.NumberLiteral{Val: 2},
+					LHS: &influxql.IntegerLiteral{Val: 1},
+					RHS: &influxql.IntegerLiteral{Val: 2},
 				},
-				RHS: &influxql.NumberLiteral{Val: 3},
+				RHS: &influxql.IntegerLiteral{Val: 3},
 			},
 		},
 
@@ -2041,14 +2671,14 @@ func TestParser_ParseExpr(t *testing.T) {
 						LHS: &influxql.BinaryExpr{
 							Op:  influxql.ADD,
 							LHS: &influxql.VarRef{Val: "value"},
-							RHS: &influxql.NumberLiteral{Val: 3},
+							RHS: &influxql.IntegerLiteral{Val: 3},
 						},
-						RHS: &influxql.NumberLiteral{Val: 30},
+						RHS: &influxql.IntegerLiteral{Val: 30},
 					},
 					RHS: &influxql.BinaryExpr{
 						Op:  influxql.ADD,
-						LHS: &influxql.NumberLiteral{Val: 1},
-						RHS: &influxql.NumberLiteral{Val: 2},
+						LHS: &influxql.IntegerLiteral{Val: 1},
+						RHS: &influxql.IntegerLiteral{Val: 2},
 					},
 				},
 				RHS: &influxql.BooleanLiteral{Val: true},
@@ -2095,11 +2725,11 @@ func TestParser_ParseExpr(t *testing.T) {
 			expr: &influxql.Call{
 				Name: "my_func",
 				Args: []influxql.Expr{
-					&influxql.NumberLiteral{Val: 1},
+					&influxql.IntegerLiteral{Val: 1},
 					&influxql.BinaryExpr{
 						Op:  influxql.ADD,
-						LHS: &influxql.NumberLiteral{Val: 2},
-						RHS: &influxql.NumberLiteral{Val: 3},
+						LHS: &influxql.IntegerLiteral{Val: 2},
+						RHS: &influxql.IntegerLiteral{Val: 3},
 					},
 				},
 			},
@@ -2131,6 +2761,10 @@ func TestParseDuration(t *testing.T) {
 		{s: `2h`, d: 2 * time.Hour},
 		{s: `2d`, d: 2 * 24 * time.Hour},
 		{s: `2w`, d: 2 * 7 * 24 * time.Hour},
+		{s: `1h30m`, d: time.Hour + 30*time.Minute},
+		{s: `30ms3000u`, d: 30*time.Millisecond + 3000*time.Microsecond},
+		{s: `-5s`, d: -5 * time.Second},
+		{s: `-5m30s`, d: -5*time.Minute - 30*time.Second},
 
 		{s: ``, err: "invalid duration"},
 		{s: `3`, err: "invalid duration"},
@@ -2199,7 +2833,7 @@ func TestQuoteIdent(t *testing.T) {
 		ident []string
 		s     string
 	}{
-		{[]string{``}, ``},
+		{[]string{``}, `""`},
 		{[]string{`select`}, `"select"`},
 		{[]string{`in-bytes`}, `"in-bytes"`},
 		{[]string{`foo`, `bar`}, `"foo".bar`},
@@ -2211,6 +2845,58 @@ func TestQuoteIdent(t *testing.T) {
 	} {
 		if s := influxql.QuoteIdent(tt.ident...); tt.s != s {
 			t.Errorf("%d. %s: mismatch: %s != %s", i, tt.ident, tt.s, s)
+		}
+	}
+}
+
+// Ensure DeleteSeriesStatement can convert to a string
+func TestDeleteSeriesStatement_String(t *testing.T) {
+	var tests = []struct {
+		s    string
+		stmt influxql.Statement
+	}{
+		{
+			s:    `DELETE FROM src`,
+			stmt: &influxql.DeleteSeriesStatement{Sources: []influxql.Source{&influxql.Measurement{Name: "src"}}},
+		},
+		{
+			s: `DELETE FROM src WHERE host = 'hosta.influxdb.org'`,
+			stmt: &influxql.DeleteSeriesStatement{
+				Sources: []influxql.Source{&influxql.Measurement{Name: "src"}},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.EQ,
+					LHS: &influxql.VarRef{Val: "host"},
+					RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
+				},
+			},
+		},
+		{
+			s: `DELETE FROM src WHERE host = 'hosta.influxdb.org'`,
+			stmt: &influxql.DeleteSeriesStatement{
+				Sources: []influxql.Source{&influxql.Measurement{Name: "src"}},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.EQ,
+					LHS: &influxql.VarRef{Val: "host"},
+					RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
+				},
+			},
+		},
+		{
+			s: `DELETE WHERE host = 'hosta.influxdb.org'`,
+			stmt: &influxql.DeleteSeriesStatement{
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.EQ,
+					LHS: &influxql.VarRef{Val: "host"},
+					RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		s := test.stmt.String()
+		if s != test.s {
+			t.Errorf("error rendering string. expected %s, actual: %s", test.s, s)
 		}
 	}
 }
@@ -2269,7 +2955,7 @@ func TestDropSeriesStatement_String(t *testing.T) {
 
 func BenchmarkParserParseStatement(b *testing.B) {
 	b.ReportAllocs()
-	s := `SELECT field FROM "series" WHERE value > 10`
+	s := `SELECT "field" FROM "series" WHERE value > 10`
 	for i := 0; i < b.N; i++ {
 		if stmt, err := influxql.NewParser(strings.NewReader(s)).ParseStatement(); err != nil {
 			b.Fatalf("unexpected error: %s", err)
@@ -2283,14 +2969,18 @@ func BenchmarkParserParseStatement(b *testing.B) {
 // MustParseSelectStatement parses a select statement. Panic on error.
 func MustParseSelectStatement(s string) *influxql.SelectStatement {
 	stmt, err := influxql.NewParser(strings.NewReader(s)).ParseStatement()
-	panicIfErr(err)
+	if err != nil {
+		panic(err)
+	}
 	return stmt.(*influxql.SelectStatement)
 }
 
 // MustParseExpr parses an expression. Panic on error.
 func MustParseExpr(s string) influxql.Expr {
 	expr, err := influxql.NewParser(strings.NewReader(s)).ParseExpr()
-	panicIfErr(err)
+	if err != nil {
+		panic(err)
+	}
 	return expr
 }
 
@@ -2303,7 +2993,7 @@ func errstring(err error) string {
 }
 
 // newAlterRetentionPolicyStatement creates an initialized AlterRetentionPolicyStatement.
-func newAlterRetentionPolicyStatement(name string, DB string, d time.Duration, replication int, dfault bool) *influxql.AlterRetentionPolicyStatement {
+func newAlterRetentionPolicyStatement(name string, DB string, d, sd time.Duration, replication int, dfault bool) *influxql.AlterRetentionPolicyStatement {
 	stmt := &influxql.AlterRetentionPolicyStatement{
 		Name:     name,
 		Database: DB,
@@ -2312,6 +3002,10 @@ func newAlterRetentionPolicyStatement(name string, DB string, d time.Duration, r
 
 	if d > -1 {
 		stmt.Duration = &d
+	}
+
+	if sd > -1 {
+		stmt.ShardGroupDuration = &sd
 	}
 
 	if replication > -1 {
@@ -2323,19 +3017,25 @@ func newAlterRetentionPolicyStatement(name string, DB string, d time.Duration, r
 
 // mustMarshalJSON encodes a value to JSON.
 func mustMarshalJSON(v interface{}) []byte {
-	b, err := json.Marshal(v)
-	panicIfErr(err)
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		panic(err)
+	}
 	return b
 }
 
 func mustParseDuration(s string) time.Duration {
 	d, err := influxql.ParseDuration(s)
-	panicIfErr(err)
-	return d
-}
-
-func panicIfErr(err error) {
 	if err != nil {
 		panic(err)
 	}
+	return d
+}
+
+func duration(v time.Duration) *time.Duration {
+	return &v
+}
+
+func intptr(v int) *int {
+	return &v
 }

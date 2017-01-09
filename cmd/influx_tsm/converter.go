@@ -2,13 +2,18 @@ package main
 
 import (
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 
-	"github.com/influxdb/influxdb/tsdb/engine/tsm1"
+	"github.com/influxdata/influxdb/cmd/influx_tsm/stats"
+	"github.com/influxdata/influxdb/tsdb/engine/tsm1"
 )
 
+const (
+	maxBlocksPerKey = 65535
+)
+
+// KeyIterator is used to iterate over b* keys for conversion to tsm keys
 type KeyIterator interface {
 	Next() bool
 	Read() (string, []tsm1.Value, error)
@@ -19,15 +24,15 @@ type Converter struct {
 	path           string
 	maxTSMFileSize uint32
 	sequence       int
-	tracker        *tracker
+	stats          *stats.Stats
 }
 
 // NewConverter returns a new instance of the Converter.
-func NewConverter(path string, sz uint32, t *tracker) *Converter {
+func NewConverter(path string, sz uint32, stats *stats.Stats) *Converter {
 	return &Converter{
 		path:           path,
 		maxTSMFileSize: sz,
-		tracker:        t,
+		stats:          stats,
 	}
 }
 
@@ -40,33 +45,36 @@ func (c *Converter) Process(iter KeyIterator) error {
 
 	// Iterate until no more data remains.
 	var w tsm1.TSMWriter
+	var keyCount map[string]int
+
 	for iter.Next() {
 		k, v, err := iter.Read()
 		if err != nil {
 			return err
 		}
-		scrubbed := c.scrubValues(v)
 
 		if w == nil {
 			w, err = c.nextTSMWriter()
 			if err != nil {
 				return err
 			}
+			keyCount = map[string]int{}
 		}
-		if err := w.Write(k, scrubbed); err != nil {
+		if err := w.Write(k, v); err != nil {
 			return err
 		}
+		keyCount[k]++
 
-		c.tracker.AddPointsRead(len(v))
-		c.tracker.AddPointsWritten(len(scrubbed))
+		c.stats.AddPointsRead(len(v))
+		c.stats.AddPointsWritten(len(v))
 
 		// If we have a max file size configured and we're over it, start a new TSM file.
-		if w.Size() > c.maxTSMFileSize {
+		if w.Size() > c.maxTSMFileSize || keyCount[k] == maxBlocksPerKey {
 			if err := w.WriteIndex(); err != nil && err != tsm1.ErrNoValues {
 				return err
 			}
 
-			c.tracker.AddTSMBytes(w.Size())
+			c.stats.AddTSMBytes(w.Size())
 
 			if err := w.Close(); err != nil {
 				return err
@@ -79,7 +87,7 @@ func (c *Converter) Process(iter KeyIterator) error {
 		if err := w.WriteIndex(); err != nil && err != tsm1.ErrNoValues {
 			return err
 		}
-		c.tracker.AddTSMBytes(w.Size())
+		c.stats.AddTSMBytes(w.Size())
 
 		if err := w.Close(); err != nil {
 			return err
@@ -105,49 +113,6 @@ func (c *Converter) nextTSMWriter() (tsm1.TSMWriter, error) {
 		return nil, err
 	}
 
-	c.tracker.IncrTSMFileCount()
+	c.stats.IncrTSMFileCount()
 	return w, nil
-}
-
-// scrubValues takes a slice and removes float64 NaN and Inf. If neither is
-// present in the slice, the original slice is returned. This is to avoid
-// copying slices unnecessarily.
-func (c *Converter) scrubValues(values []tsm1.Value) []tsm1.Value {
-	var scrubbed []tsm1.Value
-
-	if values == nil {
-		return nil
-	}
-
-	for i, v := range values {
-		if f, ok := v.Value().(float64); ok {
-			var filter bool
-			if math.IsNaN(f) {
-				filter = true
-				c.tracker.IncrNaN()
-			}
-			if math.IsInf(f, 0) {
-				filter = true
-				c.tracker.IncrInf()
-			}
-
-			if filter {
-				if scrubbed == nil {
-					// Take every value up to the NaN, indicating that scrubbed
-					// should now be used.
-					scrubbed = values[:i]
-				}
-			} else {
-				if scrubbed != nil {
-					// We've filtered at least 1 value, so add value to filtered slice.
-					scrubbed = append(scrubbed, v)
-				}
-			}
-		}
-	}
-
-	if scrubbed != nil {
-		return scrubbed
-	}
-	return values
 }

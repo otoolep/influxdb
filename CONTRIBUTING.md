@@ -57,7 +57,7 @@ To assist in review for the PR, please add the following to your pull request co
 - [ ] CHANGELOG.md updated
 - [ ] Rebased/mergable
 - [ ] Tests pass
-- [ ] Sign [CLA](http://influxdb.com/community/cla.html) (if not already signed)
+- [ ] Sign [CLA](https://influxdata.com/community/cla/) (if not already signed)
 ```
 
 Signing the CLA
@@ -65,11 +65,11 @@ Signing the CLA
 
 If you are going to be contributing back to InfluxDB please take a
 second to sign our CLA, which can be found
-[on our website](http://influxdb.com/community/cla.html).
+[on our website](https://influxdata.com/community/cla/).
 
 Installing Go
 -------------
-InfluxDB requires Go 1.4.3.
+InfluxDB requires Go 1.7.4.
 
 At InfluxDB we find gvm, a Go version manager, useful for installing Go. For instructions
 on how to install it see [the gvm page on github](https://github.com/moovweb/gvm).
@@ -77,8 +77,14 @@ on how to install it see [the gvm page on github](https://github.com/moovweb/gvm
 After installing gvm you can install and set the default go version by
 running the following:
 
-    gvm install go1.4.3
-    gvm use go1.4.3 --default
+    gvm install go1.7.4
+    gvm use go1.7.4 --default
+
+Installing GDM
+-------------
+InfluxDB uses [gdm](https://github.com/sparrc/gdm) to manage dependencies.  Install it by running the following:
+
+    go get github.com/sparrc/gdm
 
 Revision Control Systems
 -------------
@@ -95,7 +101,7 @@ Setup the project structure and fetch the repo like so:
 ```bash
     mkdir $HOME/gocodez
     export GOPATH=$HOME/gocodez
-    go get github.com/influxdb/influxdb
+    go get github.com/influxdata/influxdb
 ```
 
 You can add the line `export GOPATH=$HOME/gocodez` to your bash/zsh file to be set for every shell instead of having to manually run it everytime.
@@ -106,12 +112,12 @@ If you wish to work with fork of InfluxDB, your own fork for example, you must s
 
 ```bash
     export GOPATH=$HOME/gocodez
-    mkdir -p $GOPATH/src/github.com/influxdb
-    cd $GOPATH/src/github.com/influxdb
+    mkdir -p $GOPATH/src/github.com/influxdata
+    cd $GOPATH/src/github.com/influxdata
     git clone git@github.com:<username>/influxdb
 ```
 
-Retaining the directory structure `$GOPATH/src/github.com/influxdb` is necessary so that Go imports work correctly.
+Retaining the directory structure `$GOPATH/src/github.com/influxdata` is necessary so that Go imports work correctly.
 
 Build and Test
 -----
@@ -119,8 +125,8 @@ Build and Test
 Make sure you have Go installed and the project structure as shown above. To then get the dependencies for the project, execute the following commands:
 
 ```bash
-cd $GOPATH/src/github.com/influxdb/influxdb
-go get -u -f -t ./...
+cd $GOPATH/src/github.com/influxdata/influxdb
+gdm restore
 ```
 
 To then build and install the binaries, run the following command.
@@ -133,20 +139,24 @@ The binaries will be located in `$GOPATH/bin`. Please note that the InfluxDB bin
 To set the version and commit flags during the build pass the following to the **install** command:
 
 ```bash
--ldflags="-X main.version=$VERSION -X main.branch=$BRANCH -X main.commit=$COMMIT -X main.buildTime=$TIME"
+-ldflags="-X main.version=$VERSION -X main.branch=$BRANCH -X main.commit=$COMMIT"
 ```
 
-where `$VERSION` is the version, `$BRANCH` is the branch, `$COMMIT` is the git commit hash, and `$TIME` is the build timestamp.
+where `$VERSION` is the version, `$BRANCH` is the branch, and `$COMMIT` is the git commit hash.
 
-If you want to build packages, see `package.sh` help:
+If you want to build packages, see `build.py` usage information:
+
 ```bash
-package.sh -h
+python build.py --help
+
+# Or to build a package for your current system
+python build.py --package
 ```
 
 To run the tests, execute the following command:
 
 ```bash
-cd $GOPATH/src/github.com/influxdb/influxdb
+cd $GOPATH/src/github.com/influxdata/influxdb
 go test -v ./...
 
 # run tests that match some pattern
@@ -187,12 +197,37 @@ If generating the protobuf code is failing for you, check each of the following:
 * Ensure the protobuf library can be found. Make sure that `LD_LIBRRARY_PATH` includes the directory in which the library `libprotoc.so` has been installed.
 * Ensure the command `protoc-gen-gogo`, found in `GOPATH/bin`, is on your path. This can be done by adding `GOPATH/bin` to `PATH`.
 
+
+Generated Go Templates
+----------------------
+
+The query engine requires optimized data structures for each data type so
+instead of writing each implementation several times we use templates. _Do not
+change code that ends in a `.gen.go` extension!_ Instead you must edit the
+`.gen.go.tmpl` file that was used to generate it.
+
+Once you've edited the template file, you'll need the [`tmpl`][tmpl] utility
+to generate the code:
+
+```sh
+$ go get github.com/benbjohnson/tmpl
+```
+
+Then you can regenerate all templates in the project:
+
+```sh
+$ go generate ./...
+```
+
+[tmpl]: https://github.com/benbjohnson/tmpl
+
+
 Pre-commit checks
 -------------
 
 We have a pre-commit hook to make sure code is formatted properly and vetted before you commit any changes. We strongly recommend using the pre-commit hook to guard against accidentally committing unformatted code. To use the pre-commit hook, run the following:
 ```bash
-    cd $GOPATH/src/github.com/influxdb/influxdb
+    cd $GOPATH/src/github.com/influxdata/influxdb
     cp .hooks/pre-commit .git/hooks/
 ```
 In case the commit is rejected because it's not formatted you can run
@@ -218,7 +253,7 @@ When troubleshooting problems with CPU or memory the Go toolchain can be helpful
 
 ```sh
 # start influx with profiling
-./influxd -cpuprofile influxdcpu.prof -memprof influxdmem.prof 
+./influxd -cpuprofile influxdcpu.prof -memprof influxdmem.prof
 # run queries, writes, whatever you're testing
 # Quit out of influxd and influxd.prof will then be written.
 # open up pprof to examine the profiling data.
@@ -227,6 +262,18 @@ go tool pprof ./influxd influxd.prof
 # can also run "web <function name>" to zoom in. Or "list <function name>" to see specific lines
 ```
 Note that when you pass the binary to `go tool pprof` *you must specify the path to the binary*.
+
+If you are profiling benchmarks built with the `testing` package, you may wish
+to use the [`github.com/pkg/profile`](github.com/pkg/profile) package to limit
+the code being profiled:
+
+```go
+func BenchmarkSomething(b *testing.B) {
+  // do something intensive like fill database with data...
+  defer profile.Start(profile.ProfilePath("/tmp"), profile.MemProfile).Stop()
+  // do something that you want to profile...
+}
+```
 
 Continuous Integration testing
 -----

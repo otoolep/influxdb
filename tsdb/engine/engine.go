@@ -1,7 +1,9 @@
-package engine
+// Package engine can be imported to initialize and register all available TSDB engines.
+//
+// Alternatively, you can import any individual subpackage underneath engine.
+package engine // import "github.com/influxdata/influxdb/tsdb/engine"
 
 import (
-	_ "github.com/influxdb/influxdb/tsdb/engine/b1"
-	_ "github.com/influxdb/influxdb/tsdb/engine/bz1"
-	_ "github.com/influxdb/influxdb/tsdb/engine/tsm1"
+	// Initialize and register tsm1 engine
+	_ "github.com/influxdata/influxdb/tsdb/engine/tsm1"
 )

@@ -1,3 +1,5 @@
+// Command influx_tsm converts b1 or bz1 shards (from InfluxDB releases earlier than v0.11)
+// to the current tsm1 format.
 package main
 
 import (
@@ -11,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -19,11 +22,12 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 
-	"github.com/influxdb/influxdb/cmd/influx_tsm/b1"
-	"github.com/influxdb/influxdb/cmd/influx_tsm/bz1"
-	"github.com/influxdb/influxdb/cmd/influx_tsm/tsdb"
+	"github.com/influxdata/influxdb/cmd/influx_tsm/b1"
+	"github.com/influxdata/influxdb/cmd/influx_tsm/bz1"
+	"github.com/influxdata/influxdb/cmd/influx_tsm/tsdb"
 )
 
+// ShardReader reads b* shards and converts to tsm shards
 type ShardReader interface {
 	KeyIterator
 	Open() error
@@ -42,7 +46,7 @@ The backed-up files must be removed manually, generally after starting up the
 node again to make sure all of data has been converted correctly.
 
 To restore a backup:
-  Shut down the node, remove the converted directory, and 
+  Shut down the node, remove the converted directory, and
   copy the backed-up directory to the original location.`
 
 type options struct {
@@ -54,7 +58,8 @@ type options struct {
 	Parallel       bool
 	SkipBackup     bool
 	UpdateInterval time.Duration
-	// Quiet          bool
+	Yes            bool
+	CPUFile        string
 }
 
 func (o *options) Parse() error {
@@ -67,9 +72,10 @@ func (o *options) Parse() error {
 	fs.BoolVar(&opts.Parallel, "parallel", false, "Perform parallel conversion. (up to GOMAXPROCS shards at once)")
 	fs.BoolVar(&opts.SkipBackup, "nobackup", false, "Disable database backups. Not recommended.")
 	fs.StringVar(&opts.BackupPath, "backup", "", "The location to backup up the current databases. Must not be within the data directory.")
-	// fs.BoolVar(&opts.Quiet, "quiet", false, "Suppresses the regular status updates.")
 	fs.StringVar(&opts.DebugAddr, "debug", "", "If set, http debugging endpoints will be enabled on the given address")
 	fs.DurationVar(&opts.UpdateInterval, "interval", 5*time.Second, "How often status updates are printed.")
+	fs.BoolVar(&opts.Yes, "y", false, "Don't ask, just convert")
+	fs.StringVar(&opts.CPUFile, "profile", "", "CPU Profile location")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %v [options] <data-path> \n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "%v\n\nOptions:\n", description)
@@ -118,7 +124,7 @@ func (o *options) Parse() error {
 
 		if strings.HasPrefix(o.BackupPath, o.DataPath) {
 			fmt.Println(o.BackupPath, o.DataPath)
-			return errors.New("backup directory cannot be contained within data directory.")
+			return errors.New("backup directory cannot be contained within data directory")
 		}
 	}
 
@@ -170,11 +176,13 @@ func main() {
 	// Dump summary of what is about to happen.
 	fmt.Println("b1 and bz1 shard conversion.")
 	fmt.Println("-----------------------------------")
-	fmt.Println("Data directory is:       ", opts.DataPath)
-	fmt.Println("Backup directory is:     ", opts.BackupPath)
-	fmt.Println("Databases specified:     ", allDBs(opts.DBs))
-	fmt.Println("Database backups enabled:", yesno(!opts.SkipBackup), badUser)
-	fmt.Println("Parallel mode enabled:   ", yesno(opts.Parallel), runtime.GOMAXPROCS(0))
+	fmt.Println("Data directory is:                 ", opts.DataPath)
+	if !opts.SkipBackup {
+		fmt.Println("Backup directory is:               ", opts.BackupPath)
+	}
+	fmt.Println("Databases specified:               ", allDBs(opts.DBs))
+	fmt.Println("Database backups enabled:          ", yesno(!opts.SkipBackup), badUser)
+	fmt.Printf("Parallel mode enabled (GOMAXPROCS): %s (%d)\n", yesno(opts.Parallel), runtime.GOMAXPROCS(0))
 	fmt.Println()
 
 	shards := collectShards(dbs)
@@ -196,18 +204,31 @@ func main() {
 	}
 	w.Flush()
 
-	// Get confirmation from user.
-	fmt.Printf("\nThese shards will be converted. Proceed? y/N: ")
-	liner := bufio.NewReader(os.Stdin)
-	yn, err := liner.ReadString('\n')
-	if err != nil {
-		log.Fatalf("failed to read response: %v", err)
-	}
-	yn = strings.TrimRight(strings.ToLower(yn), "\n")
-	if yn != "y" {
-		log.Fatal("Conversion aborted.")
+	if !opts.Yes {
+		// Get confirmation from user.
+		fmt.Printf("\nThese shards will be converted. Proceed? y/N: ")
+		liner := bufio.NewReader(os.Stdin)
+		yn, err := liner.ReadString('\n')
+		if err != nil {
+			log.Fatalf("failed to read response: %v", err)
+		}
+		yn = strings.TrimRight(strings.ToLower(yn), "\n")
+		if yn != "y" {
+			log.Fatal("Conversion aborted.")
+		}
 	}
 	fmt.Println("Conversion starting....")
+
+	if opts.CPUFile != "" {
+		f, err := os.Create(opts.CPUFile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if err = pprof.StartCPUProfile(f); err != nil {
+			log.Fatal(err)
+		}
+		defer pprof.StopCPUProfile()
+	}
 
 	tr := newTracker(shards, opts)
 
@@ -316,19 +337,19 @@ func convertShard(si *tsdb.ShardInfo, tr *tracker) error {
 	var reader ShardReader
 	switch si.Format {
 	case tsdb.BZ1:
-		reader = bz1.NewReader(src)
+		reader = bz1.NewReader(src, &tr.Stats, 0)
 	case tsdb.B1:
-		reader = b1.NewReader(src)
+		reader = b1.NewReader(src, &tr.Stats, 0)
 	default:
 		return fmt.Errorf("Unsupported shard format: %v", si.FormatAsString())
 	}
-	defer reader.Close()
 
 	// Open the shard, and create a converter.
 	if err := reader.Open(); err != nil {
 		return fmt.Errorf("Failed to open %v for conversion: %v", src, err)
 	}
-	converter := NewConverter(dst, uint32(opts.TSMSize), tr)
+	defer reader.Close()
+	converter := NewConverter(dst, uint32(opts.TSMSize), &tr.Stats)
 
 	// Perform the conversion.
 	if err := converter.Process(reader); err != nil {
@@ -359,6 +380,7 @@ func NewParallelGroup(n int) ParallelGroup {
 	return make(chan struct{}, n)
 }
 
+// Do executes one operation of the ParallelGroup
 func (p ParallelGroup) Do(f func()) {
 	p <- struct{}{} // acquire working slot
 	defer func() { <-p }()

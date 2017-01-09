@@ -31,7 +31,8 @@
 //
 // http://tools.ietf.org/html/rfc4122
 
-package uuid
+// Package uuid provides functions to create time-based UUIDs.
+package uuid // import "github.com/influxdata/influxdb/uuid"
 
 import (
 	"sync/atomic"

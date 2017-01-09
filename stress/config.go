@@ -3,8 +3,9 @@ package stress
 import (
 	"flag"
 	"fmt"
-	"github.com/BurntSushi/toml"
 	"strings"
+
+	"github.com/BurntSushi/toml"
 )
 
 // Config is a struct for the Stress test configuration
@@ -30,7 +31,7 @@ type Write struct {
 // PointGenerators is a struct that contains the configuration
 // parameters for all implemented PointGenerator's.
 type PointGenerators struct {
-	Basic BasicPointGenerator `toml:"basic"`
+	Basic *BasicPointGenerator `toml:"basic"`
 }
 
 // InfluxClients is a struct that contains the configuration
@@ -99,14 +100,16 @@ func DecodeConfig(s string) (*Config, error) {
 }
 
 type outputConfig struct {
-	tags     map[string]string
-	addr     string
-	database string
+	tags            map[string]string
+	addr            string
+	database        string
+	retentionPolicy string
 }
 
-func (t *outputConfig) SetParams(addr, db string) {
+func (t *outputConfig) SetParams(addr, db, rp string) {
 	t.addr = addr
 	t.database = db
+	t.retentionPolicy = rp
 }
 
 func NewOutputConfig() *outputConfig {
@@ -114,11 +117,12 @@ func NewOutputConfig() *outputConfig {
 	tags := make(map[string]string)
 	o.tags = tags
 	database := flag.String("database", "stress", "name of database where the response times will persist")
+	retentionPolicy := flag.String("retention-policy", "", "name of the retention policy where the response times will persist")
 	address := flag.String("addr", "http://localhost:8086", "IP address and port of database where response times will persist (e.g., localhost:8086)")
 	flag.Var(&o, "tags", "A comma seperated list of tags")
 	flag.Parse()
 
-	o.SetParams(*address, *database)
+	o.SetParams(*address, *database, *retentionPolicy)
 
 	return &o
 
@@ -129,7 +133,7 @@ func (t *outputConfig) String() string {
 	for k, v := range t.tags {
 		s += fmt.Sprintf("%v=%v ", k, v)
 	}
-	return fmt.Sprintf("%v %v %v", s, t.database, t.addr)
+	return fmt.Sprintf("%v %v %v %v", s, t.database, t.retentionPolicy, t.addr)
 }
 
 func (t *outputConfig) Set(value string) error {

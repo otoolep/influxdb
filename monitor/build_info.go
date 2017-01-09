@@ -1,6 +1,8 @@
 package monitor
 
-// system captures build diagnostics
+import "github.com/influxdata/influxdb/monitor/diagnostics"
+
+// build holds information of the build of the current executable.
 type build struct {
 	Version string
 	Commit  string
@@ -8,7 +10,7 @@ type build struct {
 	Time    string
 }
 
-func (b *build) Diagnostics() (*Diagnostic, error) {
+func (b *build) Diagnostics() (*diagnostics.Diagnostics, error) {
 	diagnostics := map[string]interface{}{
 		"Version":    b.Version,
 		"Commit":     b.Commit,
@@ -16,5 +18,5 @@ func (b *build) Diagnostics() (*Diagnostic, error) {
 		"Build Time": b.Time,
 	}
 
-	return DiagnosticFromMap(diagnostics), nil
+	return DiagnosticsFromMap(diagnostics), nil
 }

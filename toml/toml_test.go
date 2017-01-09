@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
-	"github.com/influxdb/influxdb/cmd/influxd/run"
-	itoml "github.com/influxdb/influxdb/toml"
+	"github.com/influxdata/influxdb/cmd/influxd/run"
+	itoml "github.com/influxdata/influxdb/toml"
 )
 
 // Ensure that megabyte sizes can be parsed.
@@ -33,7 +33,7 @@ func TestSize_UnmarshalText_GB(t *testing.T) {
 
 func TestConfig_Encode(t *testing.T) {
 	var c run.Config
-	c.Cluster.WriteTimeout = itoml.Duration(time.Minute)
+	c.Coordinator.WriteTimeout = itoml.Duration(time.Minute)
 	buf := new(bytes.Buffer)
 	if err := toml.NewEncoder(buf).Encode(&c); err != nil {
 		t.Fatal("Failed to encode: ", err)

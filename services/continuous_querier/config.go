@@ -3,11 +3,12 @@ package continuous_querier
 import (
 	"time"
 
-	"github.com/influxdb/influxdb/toml"
+	"github.com/influxdata/influxdb/toml"
 )
 
 // Default values for aspects of interval computation.
 const (
+	// The default value of how often to check whether any CQs need to be run.
 	DefaultRunInterval = time.Second
 )
 

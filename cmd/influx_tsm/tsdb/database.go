@@ -1,4 +1,5 @@
-package tsdb
+// Pacage tsdb abstracts the various shard types supported by the influx_tsm command.
+package tsdb // import "github.com/influxdata/influxdb/cmd/influx_tsm/tsdb"
 
 import (
 	"fmt"
@@ -9,15 +10,17 @@ import (
 	"time"
 
 	"github.com/boltdb/bolt"
-	"github.com/influxdb/influxdb/pkg/slices"
+	"github.com/influxdata/influxdb/pkg/slices"
 )
 
+// Flags for differentiating between engines
 const (
 	B1 = iota
 	BZ1
 	TSM1
 )
 
+// EngineFormat holds the flag for the engine
 type EngineFormat int
 
 // String returns the string format of the engine.
@@ -53,6 +56,7 @@ func (s *ShardInfo) FullPath(dataPath string) string {
 	return filepath.Join(dataPath, s.Database, s.RetentionPolicy, s.Path)
 }
 
+// ShardInfos is an array of ShardInfo
 type ShardInfos []*ShardInfo
 
 func (s ShardInfos) Len() int      { return len(s) }
@@ -61,10 +65,11 @@ func (s ShardInfos) Less(i, j int) bool {
 	if s[i].Database == s[j].Database {
 		if s[i].RetentionPolicy == s[j].RetentionPolicy {
 			return s[i].Path < s[i].Path
-		} else {
-			return s[i].RetentionPolicy < s[j].RetentionPolicy
 		}
+
+		return s[i].RetentionPolicy < s[j].RetentionPolicy
 	}
+
 	return s[i].Database < s[j].Database
 }
 
@@ -76,7 +81,7 @@ func (s ShardInfos) Databases() []string {
 	}
 
 	var dbs []string
-	for k, _ := range dbm {
+	for k := range dbm {
 		dbs = append(dbs, k)
 	}
 	sort.Strings(dbs)
@@ -168,6 +173,10 @@ func (d *Database) Shards() ([]*ShardInfo, error) {
 
 		// Process each shard
 		shards, err := rpfd.Readdirnames(-1)
+		if err != nil {
+			return nil, err
+		}
+
 		for _, sh := range shards {
 			fmt, sz, err := shardFormat(filepath.Join(d.path, rp, sh))
 			if err != nil {
@@ -192,12 +201,7 @@ func (d *Database) Shards() ([]*ShardInfo, error) {
 // shardFormat returns the format and size on disk of the shard at path.
 func shardFormat(path string) (EngineFormat, int64, error) {
 	// If it's a directory then it's a tsm1 engine
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, 0, err
-	}
-	fi, err := f.Stat()
-	f.Close()
+	fi, err := os.Stat(path)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -224,13 +228,13 @@ func shardFormat(path string) (EngineFormat, int64, error) {
 		}
 
 		// There is an actual format indicator.
-		switch string(b.Get([]byte("format"))) {
+		switch f := string(b.Get([]byte("format"))); f {
 		case "b1", "v1":
 			format = B1
 		case "bz1":
 			format = BZ1
 		default:
-			return fmt.Errorf("unrecognized engine format: %s", string(b.Get([]byte("format"))))
+			return fmt.Errorf("unrecognized engine format: %s", f)
 		}
 
 		return nil

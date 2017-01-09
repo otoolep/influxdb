@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/influxdb/influxdb/models"
-	"github.com/influxdb/influxdb/toml"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/toml"
 )
 
 const (
@@ -23,7 +23,7 @@ const (
 	DefaultConsistencyLevel = "one"
 
 	// DefaultSeparator is the default join character to use when joining multiple
-	// measurment parts in a template.
+	// measurement parts in a template.
 	DefaultSeparator = "."
 
 	// DefaultBatchSize is the default write batch size.
@@ -51,9 +51,10 @@ const (
 
 // Config represents the configuration for Graphite endpoints.
 type Config struct {
+	Enabled          bool          `toml:"enabled"`
 	BindAddress      string        `toml:"bind-address"`
 	Database         string        `toml:"database"`
-	Enabled          bool          `toml:"enabled"`
+	RetentionPolicy  string        `toml:"retention-policy"`
 	Protocol         string        `toml:"protocol"`
 	BatchSize        int           `toml:"batch-size"`
 	BatchPending     int           `toml:"batch-pending"`
@@ -63,6 +64,20 @@ type Config struct {
 	Tags             []string      `toml:"tags"`
 	Separator        string        `toml:"separator"`
 	UDPReadBuffer    int           `toml:"udp-read-buffer"`
+}
+
+// NewConfig returns a new instance of Config with defaults.
+func NewConfig() Config {
+	return Config{
+		BindAddress:      DefaultBindAddress,
+		Database:         DefaultDatabase,
+		Protocol:         DefaultProtocol,
+		BatchSize:        DefaultBatchSize,
+		BatchPending:     DefaultBatchPending,
+		BatchTimeout:     toml.Duration(DefaultBatchTimeout),
+		ConsistencyLevel: DefaultConsistencyLevel,
+		Separator:        DefaultSeparator,
+	}
 }
 
 // WithDefaults takes the given config and returns a new config with any required
@@ -101,12 +116,12 @@ func (c *Config) WithDefaults() *Config {
 
 // DefaultTags returns the config's tags.
 func (c *Config) DefaultTags() models.Tags {
-	tags := models.Tags{}
+	m := make(map[string]string, len(c.Tags))
 	for _, t := range c.Tags {
 		parts := strings.Split(t, "=")
-		tags[parts[0]] = parts[1]
+		m[parts[0]] = parts[1]
 	}
-	return tags
+	return models.NewTags(m)
 }
 
 // Validate validates the config's templates and tags.
